@@ -12,6 +12,7 @@ const MAX_QUERY_LENGTH = 512;
 const MAX_TAG_LENGTH = 64;
 const MAX_TAG_COUNT = 16;
 const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9:/_-]*$/;
+const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS memories (
@@ -28,6 +29,28 @@ const SCHEMA_STATEMENTS = [
 	ON memories(tags)`,
 ];
 
+const OAUTH_SCHEMA_STATEMENTS = [
+	`CREATE TABLE IF NOT EXISTS oauth_clients (
+		id TEXT PRIMARY KEY,
+		redirect_uris TEXT NOT NULL,
+		name TEXT,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	)`,
+	`CREATE TABLE IF NOT EXISTS oauth_codes (
+		code TEXT PRIMARY KEY,
+		client_id TEXT NOT NULL,
+		redirect_uri TEXT NOT NULL,
+		code_challenge TEXT,
+		code_challenge_method TEXT,
+		expires_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS oauth_tokens (
+		token TEXT PRIMARY KEY,
+		client_id TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	)`,
+];
+
 type MemoryRow = {
 	id: string;
 	namespace: string;
@@ -36,6 +59,21 @@ type MemoryRow = {
 	source: string | null;
 	created_at: string;
 	score?: number;
+};
+
+type OAuthClientRow = {
+	id: string;
+	redirect_uris: string;
+	name: string | null;
+};
+
+type OAuthCodeRow = {
+	code: string;
+	client_id: string;
+	redirect_uri: string;
+	code_challenge: string | null;
+	code_challenge_method: string | null;
+	expires_at: string;
 };
 
 type WorkerEnv = {
@@ -47,6 +85,7 @@ type WorkerEnv = {
 };
 
 let schemaReady: Promise<void> | undefined;
+let oauthSchemaReady: Promise<void> | undefined;
 
 function normalizeNamespace(value?: string) {
 	const trimmed = value?.trim().toLowerCase();
@@ -205,69 +244,40 @@ function constantTimeEqual(left: string, right: string) {
 	return timingSafeEqual(leftBytes, rightBytes);
 }
 
-function authorizeRequest(request: Request, env: WorkerEnv) {
-	if (isTruthy(env.ALLOW_UNAUTHENTICATED)) {
-		return { ok: true as const };
-	}
+function generateToken(bytes = 32): string {
+	const array = new Uint8Array(bytes);
+	crypto.getRandomValues(array);
+	return btoa(String.fromCharCode(...array))
+		.replace(/\+/g, '-')
+		.replace(/\//g, '_')
+		.replace(/=/g, '');
+}
 
-	const sharedToken = env.MCP_SHARED_TOKEN?.trim();
+async function verifyPkceChallenge(verifier: string, challenge: string): Promise<boolean> {
+	const data = new TextEncoder().encode(verifier);
+	const digest = await crypto.subtle.digest('SHA-256', data);
+	const base64url = btoa(String.fromCharCode(...new Uint8Array(digest)))
+		.replace(/\+/g, '-')
+		.replace(/\//g, '_')
+		.replace(/=/g, '');
+	return base64url === challenge;
+}
 
-	if (!sharedToken) {
-		return {
-			ok: false as const,
-			response: Response.json(
-				{
-					ok: false,
-					error: 'MCP_SHARED_TOKEN is not configured.',
-				},
-				{ status: 503 },
-			),
-		};
-	}
+function htmlEscape(str: string): string {
+	return str
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#39;');
+}
 
-	const authorization = request.headers.get('authorization');
-
-	if (!authorization?.startsWith('Bearer ')) {
-		return {
-			ok: false as const,
-			response: new Response(
-				JSON.stringify({
-					ok: false,
-					error: 'Unauthorized.',
-				}),
-				{
-					status: 401,
-					headers: {
-						'Content-Type': 'application/json',
-						'WWW-Authenticate': 'Bearer',
-					},
-				},
-			),
-		};
-	}
-
-	const token = authorization.slice(7).trim();
-
-	if (!constantTimeEqual(token, sharedToken)) {
-		return {
-			ok: false as const,
-			response: new Response(
-				JSON.stringify({
-					ok: false,
-					error: 'Unauthorized.',
-				}),
-				{
-					status: 401,
-					headers: {
-						'Content-Type': 'application/json',
-						'WWW-Authenticate': 'Bearer',
-					},
-				},
-			),
-		};
-	}
-
-	return { ok: true as const };
+function corsHeaders() {
+	return {
+		'Access-Control-Allow-Origin': '*',
+		'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+	};
 }
 
 async function ensureSchema(db: D1Database) {
@@ -286,100 +296,311 @@ async function ensureSchema(db: D1Database) {
 	await schemaReady;
 }
 
-async function embedText(env: WorkerEnv, text: string) {
-	const result = (await env.AI.run(EMBEDDING_MODEL, {
-		text: [text],
-		pooling: EMBEDDING_POOLING,
-	})) as Ai_Cf_Baai_Bge_Base_En_V1_5_Output;
+async function ensureOAuthSchema(db: D1Database) {
+	if (!oauthSchemaReady) {
+		oauthSchemaReady = (async () => {
+			try {
+				for (const statement of OAUTH_SCHEMA_STATEMENTS) {
+					await db.prepare(statement).run();
+				}
+			} catch (error) {
+				oauthSchemaReady = undefined;
+				throw error;
+			}
+		})();
+	}
+	await oauthSchemaReady;
+}
 
-	if (!('data' in result) || !result.data?.[0]) {
-		throw new Error('Embedding model did not return a vector.');
+async function authorizeRequest(request: Request, env: WorkerEnv) {
+	if (isTruthy(env.ALLOW_UNAUTHENTICATED)) {
+		return { ok: true as const };
 	}
 
-	return result.data[0];
-}
+	const sharedToken = env.MCP_SHARED_TOKEN?.trim() || null;
+	const authorization = request.headers.get('authorization');
+	const token = authorization?.startsWith('Bearer ') ? authorization.slice(7).trim() : null;
 
-async function fetchRowsByIds(env: WorkerEnv, namespace: string, ids: string[]) {
-	if (ids.length === 0) {
-		return [] as MemoryRow[];
+	// Fast path: shared bearer token (backward compatible)
+	if (token && sharedToken && constantTimeEqual(token, sharedToken)) {
+		return { ok: true as const };
 	}
 
-	const placeholders = ids.map((_, index) => `?${index + 2}`).join(', ');
-	const statement = env.MEMORY_DB.prepare(
-		`SELECT id, namespace, content, tags, source, created_at
-		 FROM memories
-		 WHERE namespace = ?1
-		   AND id IN (${placeholders})`,
-	).bind(namespace, ...ids);
+	// Check OAuth access tokens in D1
+	if (token) {
+		await ensureOAuthSchema(env.MEMORY_DB);
+		const row = await env.MEMORY_DB
+			.prepare('SELECT token FROM oauth_tokens WHERE token = ?1')
+			.bind(token)
+			.first<{ token: string }>();
+		if (row) {
+			return { ok: true as const };
+		}
+	}
 
-	const { results } = await statement.all<MemoryRow>();
-	const byId = new Map(results.map((row) => [row.id, row]));
-	return ids.map((id) => byId.get(id)).filter((row): row is MemoryRow => Boolean(row));
+	// Not authenticated — return the right error
+	if (!sharedToken) {
+		return {
+			ok: false as const,
+			response: Response.json(
+				{ ok: false, error: 'MCP_SHARED_TOKEN is not configured.' },
+				{ status: 503 },
+			),
+		};
+	}
+
+	return {
+		ok: false as const,
+		response: new Response(
+			JSON.stringify({ ok: false, error: 'Unauthorized.' }),
+			{
+				status: 401,
+				headers: {
+					'Content-Type': 'application/json',
+					'WWW-Authenticate': 'Bearer resource_metadata="/.well-known/oauth-authorization-server"',
+				},
+			},
+		),
+	};
 }
 
-async function queryRecentMemories(env: WorkerEnv, namespace: string, tag: string, limit: number) {
-	const { results } = await env.MEMORY_DB.prepare(
-		`SELECT id, namespace, content, tags, source, created_at
-		 FROM memories
-		 WHERE namespace = ?1
-		   AND (?2 = '' OR tags LIKE '%' || ?2 || '%')
-		 ORDER BY created_at DESC
-		 LIMIT ?3`,
-	)
-		.bind(namespace, tag, limit)
-		.all<MemoryRow>();
+function renderAuthPage(
+	clientName: string,
+	clientId: string,
+	redirectUri: string,
+	state: string,
+	codeChallenge: string,
+	codeChallengeMethod: string,
+	error: string | null,
+): Response {
+	const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>secondbrain — Authorize</title>
+	<style>
+		*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+		body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 1rem; }
+		.card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.08); padding: 2rem; width: 100%; max-width: 380px; }
+		h1 { font-size: 1.25rem; font-weight: 700; color: #111; margin-bottom: .25rem; }
+		.subtitle { font-size: .875rem; color: #666; margin-bottom: 1.5rem; }
+		.subtitle strong { color: #111; }
+		label { display: block; font-size: .875rem; font-weight: 500; color: #333; margin-bottom: .375rem; }
+		input[type=password] { width: 100%; padding: .625rem .75rem; border: 1px solid #ddd; border-radius: 8px; font-size: 1rem; outline: none; transition: border-color .15s; }
+		input[type=password]:focus { border-color: #0066ff; box-shadow: 0 0 0 3px rgba(0,102,255,.12); }
+		.error { background: #fff0f0; border: 1px solid #ffcdd2; border-radius: 8px; color: #c62828; font-size: .875rem; padding: .625rem .75rem; margin-bottom: 1rem; }
+		button { width: 100%; padding: .75rem; background: #0066ff; color: #fff; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; margin-top: 1rem; transition: background .15s; }
+		button:hover { background: #0052cc; }
+	</style>
+</head>
+<body>
+	<div class="card">
+		<h1>secondbrain</h1>
+		<p class="subtitle">Authorizing <strong>${htmlEscape(clientName)}</strong> to access your memories.</p>
+		${error ? `<div class="error">${htmlEscape(error)}</div>` : ''}
+		<form method="POST">
+			<input type="hidden" name="client_id" value="${htmlEscape(clientId)}">
+			<input type="hidden" name="redirect_uri" value="${htmlEscape(redirectUri)}">
+			<input type="hidden" name="state" value="${htmlEscape(state)}">
+			<input type="hidden" name="code_challenge" value="${htmlEscape(codeChallenge)}">
+			<input type="hidden" name="code_challenge_method" value="${htmlEscape(codeChallengeMethod)}">
+			<label for="password">Admin password</label>
+			<input type="password" id="password" name="password" autocomplete="current-password" autofocus required>
+			<button type="submit">Authorize access</button>
+		</form>
+	</div>
+</body>
+</html>`;
 
-	return results;
-}
-
-async function queryKeywordMemories(env: WorkerEnv, namespace: string, query: string, tag: string, limit: number) {
-	const { results } = await env.MEMORY_DB.prepare(
-		`SELECT
-			id,
-			namespace,
-			content,
-			tags,
-			source,
-			created_at,
-			(
-				CASE WHEN lower(content) LIKE '%' || ?2 || '%' THEN 2 ELSE 0 END +
-				CASE WHEN lower(tags) LIKE '%' || ?2 || '%' THEN 1 ELSE 0 END +
-				CASE WHEN lower(COALESCE(source, '')) LIKE '%' || ?2 || '%' THEN 1 ELSE 0 END
-			) AS score
-		 FROM memories
-		 WHERE namespace = ?1
-		   AND (
-			 lower(content) LIKE '%' || ?2 || '%'
-			 OR lower(tags) LIKE '%' || ?2 || '%'
-			 OR lower(COALESCE(source, '')) LIKE '%' || ?2 || '%'
-		   )
-		   AND (?3 = '' OR lower(tags) LIKE '%' || ?3 || '%')
-		 ORDER BY score DESC, created_at DESC
-		 LIMIT ?4`,
-	)
-		.bind(namespace, query, tag, limit)
-		.all<MemoryRow>();
-
-	return results;
-}
-
-async function querySemanticMemories(env: WorkerEnv, namespace: string, query: string, tag: string, limit: number) {
-	const embedding = await embedText(env, query);
-	const results = await env.MEMORY_INDEX.query(embedding, {
-		topK: Math.min(limit * 3, 50),
-		namespace,
+	return new Response(html, {
+		status: error ? 400 : 200,
+		headers: { 'Content-Type': 'text/html; charset=utf-8' },
 	});
+}
 
-	const ids = results.matches.map((match) => match.id);
-	const rows = await fetchRowsByIds(env, namespace, ids);
-	const scoreById = new Map(results.matches.map((match) => [match.id, match.score]));
+async function handleOAuthRegister(request: Request, env: WorkerEnv): Promise<Response> {
+	await ensureOAuthSchema(env.MEMORY_DB);
 
-	return rows
-		.filter((row) => rowHasTag(row, tag))
-		.map((row) => ({
-			...row,
-			score: scoreById.get(row.id),
-		}));
+	let body: Record<string, unknown>;
+	try {
+		body = await request.json();
+	} catch {
+		return Response.json(
+			{ error: 'invalid_request', error_description: 'Invalid JSON body.' },
+			{ status: 400, headers: corsHeaders() },
+		);
+	}
+
+	const redirectUris = body['redirect_uris'];
+	if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every((u) => typeof u === 'string')) {
+		return Response.json(
+			{ error: 'invalid_request', error_description: 'redirect_uris must be a non-empty array of strings.' },
+			{ status: 400, headers: corsHeaders() },
+		);
+	}
+
+	const clientId = generateToken(16);
+	const name = typeof body['client_name'] === 'string' ? body['client_name'] : null;
+
+	await env.MEMORY_DB
+		.prepare('INSERT INTO oauth_clients (id, redirect_uris, name) VALUES (?1, ?2, ?3)')
+		.bind(clientId, (redirectUris as string[]).join(' '), name)
+		.run();
+
+	return Response.json(
+		{
+			client_id: clientId,
+			redirect_uris: redirectUris,
+			...(name ? { client_name: name } : {}),
+		},
+		{ status: 201, headers: corsHeaders() },
+	);
+}
+
+async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
+	await ensureOAuthSchema(env.MEMORY_DB);
+
+	// Read params from query string (GET) or form body (POST re-render on error)
+	const qp = url.searchParams;
+	const clientId = qp.get('client_id') ?? '';
+	const redirectUri = qp.get('redirect_uri') ?? '';
+	const state = qp.get('state') ?? '';
+	const codeChallenge = qp.get('code_challenge') ?? '';
+	const codeChallengeMethod = qp.get('code_challenge_method') ?? 'S256';
+
+	if (qp.get('response_type') !== 'code') {
+		return Response.json({ error: 'unsupported_response_type' }, { status: 400 });
+	}
+
+	if (!clientId) {
+		return Response.json({ error: 'invalid_request', error_description: 'client_id is required.' }, { status: 400 });
+	}
+
+	const client = await env.MEMORY_DB
+		.prepare('SELECT id, redirect_uris, name FROM oauth_clients WHERE id = ?1')
+		.bind(clientId)
+		.first<OAuthClientRow>();
+
+	if (!client) {
+		return Response.json({ error: 'invalid_client', error_description: 'Unknown client_id.' }, { status: 400 });
+	}
+
+	const allowedUris = client.redirect_uris.split(' ').filter(Boolean);
+	if (redirectUri && !allowedUris.includes(redirectUri)) {
+		return Response.json({ error: 'invalid_request', error_description: 'redirect_uri does not match registered URIs.' }, { status: 400 });
+	}
+
+	const finalRedirectUri = redirectUri || allowedUris[0] || '';
+	if (!finalRedirectUri) {
+		return Response.json({ error: 'invalid_request', error_description: 'No redirect_uri available.' }, { status: 400 });
+	}
+
+	if (request.method === 'POST') {
+		const formData = await request.formData();
+		const password = formData.get('password') as string | null;
+		const formClientId = (formData.get('client_id') as string | null) ?? clientId;
+		const formRedirectUri = (formData.get('redirect_uri') as string | null) ?? finalRedirectUri;
+		const formState = (formData.get('state') as string | null) ?? state;
+		const formCodeChallenge = (formData.get('code_challenge') as string | null) ?? codeChallenge;
+		const formChallengeMethod = (formData.get('code_challenge_method') as string | null) ?? codeChallengeMethod;
+
+		const sharedToken = env.MCP_SHARED_TOKEN?.trim();
+		if (!sharedToken) {
+			return renderAuthPage(client.name ?? clientId, formClientId, formRedirectUri, formState, formCodeChallenge, formChallengeMethod, 'Server is not configured. Set MCP_SHARED_TOKEN to enable login.');
+		}
+
+		if (!password || !constantTimeEqual(password, sharedToken)) {
+			return renderAuthPage(client.name ?? clientId, formClientId, formRedirectUri, formState, formCodeChallenge, formChallengeMethod, 'Incorrect password. Try again.');
+		}
+
+		// Issue authorization code
+		const code = generateToken(32);
+		const expiresAt = new Date(Date.now() + AUTH_CODE_TTL_MS).toISOString();
+
+		await env.MEMORY_DB
+			.prepare('INSERT INTO oauth_codes (code, client_id, redirect_uri, code_challenge, code_challenge_method, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)')
+			.bind(code, formClientId, formRedirectUri, formCodeChallenge || null, formChallengeMethod || null, expiresAt)
+			.run();
+
+		const redirectUrl = new URL(formRedirectUri);
+		redirectUrl.searchParams.set('code', code);
+		if (formState) redirectUrl.searchParams.set('state', formState);
+
+		return Response.redirect(redirectUrl.toString(), 302);
+	}
+
+	// GET: show login page
+	return renderAuthPage(client.name ?? clientId, clientId, finalRedirectUri, state, codeChallenge, codeChallengeMethod, null);
+}
+
+async function handleOAuthToken(request: Request, env: WorkerEnv): Promise<Response> {
+	await ensureOAuthSchema(env.MEMORY_DB);
+
+	let params: URLSearchParams;
+	try {
+		params = new URLSearchParams(await request.text());
+	} catch {
+		return Response.json({ error: 'invalid_request' }, { status: 400, headers: corsHeaders() });
+	}
+
+	if (params.get('grant_type') !== 'authorization_code') {
+		return Response.json({ error: 'unsupported_grant_type' }, { status: 400, headers: corsHeaders() });
+	}
+
+	const code = params.get('code') ?? '';
+	const redirectUri = params.get('redirect_uri') ?? '';
+	const codeVerifier = params.get('code_verifier') ?? '';
+
+	if (!code) {
+		return Response.json({ error: 'invalid_request', error_description: 'code is required.' }, { status: 400, headers: corsHeaders() });
+	}
+
+	const codeRow = await env.MEMORY_DB
+		.prepare('SELECT * FROM oauth_codes WHERE code = ?1')
+		.bind(code)
+		.first<OAuthCodeRow>();
+
+	if (!codeRow) {
+		return Response.json({ error: 'invalid_grant', error_description: 'Unknown or expired authorization code.' }, { status: 400, headers: corsHeaders() });
+	}
+
+	// Delete code immediately — single use
+	await env.MEMORY_DB.prepare('DELETE FROM oauth_codes WHERE code = ?1').bind(code).run();
+
+	if (new Date(codeRow.expires_at) < new Date()) {
+		return Response.json({ error: 'invalid_grant', error_description: 'Authorization code has expired.' }, { status: 400, headers: corsHeaders() });
+	}
+
+	if (redirectUri && redirectUri !== codeRow.redirect_uri) {
+		return Response.json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch.' }, { status: 400, headers: corsHeaders() });
+	}
+
+	// PKCE verification
+	if (codeRow.code_challenge) {
+		if (!codeVerifier) {
+			return Response.json({ error: 'invalid_grant', error_description: 'code_verifier is required.' }, { status: 400, headers: corsHeaders() });
+		}
+		if (codeRow.code_challenge_method !== 'S256') {
+			return Response.json({ error: 'invalid_grant', error_description: 'Unsupported code_challenge_method.' }, { status: 400, headers: corsHeaders() });
+		}
+		const valid = await verifyPkceChallenge(codeVerifier, codeRow.code_challenge);
+		if (!valid) {
+			return Response.json({ error: 'invalid_grant', error_description: 'code_verifier does not match challenge.' }, { status: 400, headers: corsHeaders() });
+		}
+	}
+
+	// Issue access token
+	const accessToken = generateToken(32);
+	await env.MEMORY_DB
+		.prepare('INSERT INTO oauth_tokens (token, client_id) VALUES (?1, ?2)')
+		.bind(accessToken, codeRow.client_id)
+		.run();
+
+	return Response.json(
+		{ access_token: accessToken, token_type: 'bearer' },
+		{ headers: corsHeaders() },
+	);
 }
 
 function createServer(env: WorkerEnv) {
@@ -613,13 +834,146 @@ function createServer(env: WorkerEnv) {
 	return server;
 }
 
+async function embedText(env: WorkerEnv, text: string) {
+	const result = (await env.AI.run(EMBEDDING_MODEL, {
+		text: [text],
+		pooling: EMBEDDING_POOLING,
+	})) as Ai_Cf_Baai_Bge_Base_En_V1_5_Output;
+
+	if (!('data' in result) || !result.data?.[0]) {
+		throw new Error('Embedding model did not return a vector.');
+	}
+
+	return result.data[0];
+}
+
+async function fetchRowsByIds(env: WorkerEnv, namespace: string, ids: string[]) {
+	if (ids.length === 0) {
+		return [] as MemoryRow[];
+	}
+
+	const placeholders = ids.map((_, index) => `?${index + 2}`).join(', ');
+	const statement = env.MEMORY_DB.prepare(
+		`SELECT id, namespace, content, tags, source, created_at
+		 FROM memories
+		 WHERE namespace = ?1
+		   AND id IN (${placeholders})`,
+	).bind(namespace, ...ids);
+
+	const { results } = await statement.all<MemoryRow>();
+	const byId = new Map(results.map((row) => [row.id, row]));
+	return ids.map((id) => byId.get(id)).filter((row): row is MemoryRow => Boolean(row));
+}
+
+async function queryRecentMemories(env: WorkerEnv, namespace: string, tag: string, limit: number) {
+	const { results } = await env.MEMORY_DB.prepare(
+		`SELECT id, namespace, content, tags, source, created_at
+		 FROM memories
+		 WHERE namespace = ?1
+		   AND (?2 = '' OR tags LIKE '%' || ?2 || '%')
+		 ORDER BY created_at DESC
+		 LIMIT ?3`,
+	)
+		.bind(namespace, tag, limit)
+		.all<MemoryRow>();
+
+	return results;
+}
+
+async function queryKeywordMemories(env: WorkerEnv, namespace: string, query: string, tag: string, limit: number) {
+	const { results } = await env.MEMORY_DB.prepare(
+		`SELECT
+			id,
+			namespace,
+			content,
+			tags,
+			source,
+			created_at,
+			(
+				CASE WHEN lower(content) LIKE '%' || ?2 || '%' THEN 2 ELSE 0 END +
+				CASE WHEN lower(tags) LIKE '%' || ?2 || '%' THEN 1 ELSE 0 END +
+				CASE WHEN lower(COALESCE(source, '')) LIKE '%' || ?2 || '%' THEN 1 ELSE 0 END
+			) AS score
+		 FROM memories
+		 WHERE namespace = ?1
+		   AND (
+			 lower(content) LIKE '%' || ?2 || '%'
+			 OR lower(tags) LIKE '%' || ?2 || '%'
+			 OR lower(COALESCE(source, '')) LIKE '%' || ?2 || '%'
+		   )
+		   AND (?3 = '' OR lower(tags) LIKE '%' || ?3 || '%')
+		 ORDER BY score DESC, created_at DESC
+		 LIMIT ?4`,
+	)
+		.bind(namespace, query, tag, limit)
+		.all<MemoryRow>();
+
+	return results;
+}
+
+async function querySemanticMemories(env: WorkerEnv, namespace: string, query: string, tag: string, limit: number) {
+	const embedding = await embedText(env, query);
+	const results = await env.MEMORY_INDEX.query(embedding, {
+		topK: Math.min(limit * 3, 50),
+		namespace,
+	});
+
+	const ids = results.matches.map((match) => match.id);
+	const rows = await fetchRowsByIds(env, namespace, ids);
+	const scoreById = new Map(results.matches.map((match) => [match.id, match.score]));
+
+	return rows
+		.filter((row) => rowHasTag(row, tag))
+		.map((row) => ({
+			...row,
+			score: scoreById.get(row.id),
+		}));
+}
+
 export default {
 	async fetch(request, env: WorkerEnv, ctx): Promise<Response> {
 		const url = new URL(request.url);
 
+		// Handle CORS preflight for OAuth endpoints
+		if (request.method === 'OPTIONS') {
+			const oauthPaths = ['/.well-known/oauth-authorization-server', '/oauth/register', '/oauth/token'];
+			if (oauthPaths.includes(url.pathname)) {
+				return new Response(null, { status: 204, headers: corsHeaders() });
+			}
+		}
+
+		if (url.pathname === '/.well-known/oauth-authorization-server') {
+			const base = `${url.protocol}//${url.host}`;
+			return Response.json(
+				{
+					issuer: base,
+					authorization_endpoint: `${base}/oauth/authorize`,
+					token_endpoint: `${base}/oauth/token`,
+					registration_endpoint: `${base}/oauth/register`,
+					response_types_supported: ['code'],
+					grant_types_supported: ['authorization_code'],
+					code_challenge_methods_supported: ['S256'],
+					token_endpoint_auth_methods_supported: ['none'],
+				},
+				{ headers: corsHeaders() },
+			);
+		}
+
+		if (url.pathname === '/oauth/register' && request.method === 'POST') {
+			return handleOAuthRegister(request, env);
+		}
+
+		if (url.pathname === '/oauth/authorize' && (request.method === 'GET' || request.method === 'POST')) {
+			return handleOAuthAuthorize(request, env, url);
+		}
+
+		if (url.pathname === '/oauth/token' && request.method === 'POST') {
+			return handleOAuthToken(request, env);
+		}
+
 		if (url.pathname === '/mcp') {
 			if (request.method !== 'OPTIONS') {
-				const auth = authorizeRequest(request, env);
+				const auth = await authorizeRequest(request, env);
 				if (!auth.ok) {
 					return auth.response;
 				}

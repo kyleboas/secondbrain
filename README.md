@@ -146,25 +146,32 @@ Use your deployed Worker URL with `/mcp`, for example:
 https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
 ```
 
+Paste that URL into Claude (`Settings → Connectors`) or ChatGPT (custom connector settings). The client will discover OAuth automatically, redirect you to a login page, and store the access token — no manual token copying required.
+
+For scripts and local proxies that set headers directly, the raw `MCP_SHARED_TOKEN` value still works as a bearer token.
+
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
 ## Authentication
 
-The MCP endpoint now fails closed by default.
+The server has a built-in OAuth 2.0 authorization server. Set a Worker secret named `MCP_SHARED_TOKEN` — this becomes the admin password for the OAuth login page and the direct bearer token for scripts.
 
-Set a Worker secret named `MCP_SHARED_TOKEN`, then connect clients with:
+OAuth endpoints:
 
-```text
-Authorization: Bearer <your-token>
-```
+| Endpoint | Purpose |
+|----------|---------|
+| `/.well-known/oauth-authorization-server` | Discovery metadata |
+| `/oauth/register` | Dynamic client registration (RFC 7591) |
+| `/oauth/authorize` | Login page — enter your `MCP_SHARED_TOKEN` password |
+| `/oauth/token` | Token exchange (PKCE required) |
 
-For local demos or deliberately public deployments, you can opt out by setting:
+For local demos or deliberately public deployments you can opt out of auth entirely:
 
 ```text
 ALLOW_UNAUTHENTICATED=true
 ```
 
-That should be treated as a temporary development setting, not the normal production mode.
+That should be treated as a temporary development setting, not normal production mode.
 
 ## Notes
 
