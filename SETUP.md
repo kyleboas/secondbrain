@@ -68,22 +68,23 @@ Copy the returned database ID.
 npx wrangler vectorize create cloudflare-memory-index --dimensions=768 --metric=cosine
 ```
 
-## 5. Update `wrangler.jsonc`
+## 5. Keep `wrangler.jsonc` clean
 
-Set the real D1 database ID in the `MEMORY_DB` binding.
-
-Example:
+The checked-in config can keep the D1 binding by name only:
 
 ```json
 "d1_databases": [
   {
     "binding": "MEMORY_DB",
     "database_name": "cloudflare-memory-mcp",
-    "database_id": "your-real-d1-database-id",
     "migrations_dir": "migrations"
   }
 ]
 ```
+
+That avoids committing account-specific IDs to git.
+
+If you are doing the very first setup and need to link the Worker to a specific existing D1 database, do that with a local-only config change or a one-off local deploy flow, but do not commit the database ID.
 
 The Vectorize and AI bindings are already named correctly:
 
@@ -161,6 +162,7 @@ If health fails:
 
 - re-run the remote migration
 - confirm the Worker has bindings for `MEMORY_DB`, `MEMORY_INDEX`, and `AI`
+- confirm you did not accidentally commit a stale placeholder `database_id`
 
 If an MCP client cannot connect:
 
