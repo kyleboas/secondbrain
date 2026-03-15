@@ -42,6 +42,64 @@ async function fetchWithEnv(url: string, init: RequestInit = {}, customEnv: Test
 	return response;
 }
 
+async function listTools(customEnv: TestEnv) {
+	const response = await fetchWithEnv(
+		'http://example.com/mcp',
+		{
+			method: 'POST',
+			headers: {
+				Accept: 'application/json, text/event-stream',
+				'Content-Type': 'application/json',
+				Authorization: `Bearer ${customEnv.MCP_SHARED_TOKEN ?? ''}`,
+			},
+			body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+		},
+		customEnv,
+	);
+
+	const contentType = response.headers.get('content-type') ?? '';
+	const rawBody = await response.text();
+	let parsedBody: {
+		result?: {
+			tools?: Array<{
+				name: string;
+				title?: string;
+				description?: string;
+				annotations?: {
+					title?: string;
+				};
+			}>;
+		};
+	} | undefined;
+
+	if (contentType.includes('text/event-stream')) {
+		const eventPayloads = rawBody
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith('data:'))
+			.map((line) => line.slice(5).trim())
+			.filter(Boolean);
+
+		for (const payload of eventPayloads) {
+			try {
+				const candidate = JSON.parse(payload) as typeof parsedBody;
+				if (candidate?.result?.tools) {
+					parsedBody = candidate;
+					break;
+				}
+			} catch {
+				// Ignore non-JSON event payloads while scanning the stream.
+			}
+		}
+	} else if (rawBody.trim()) {
+		parsedBody = JSON.parse(rawBody) as typeof parsedBody;
+	}
+
+	return {
+		status: response.status,
+		body: parsedBody,
+	};
+}
+
 describe('cloudflare-memory-mcp worker', () => {
 	it('requires bearer auth for /mcp when a shared token is configured', async () => {
 		const request = new Request<unknown, IncomingRequestCfProperties>('http://example.com/mcp', {
@@ -116,6 +174,26 @@ describe('cloudflare-memory-mcp worker', () => {
 		await expect(response.json()).resolves.toMatchObject({
 			tools: expect.arrayContaining(['auto_remember']),
 		});
+	});
+
+	it('marks auto_remember as the preferred conversation write tool in tools/list', async () => {
+		const { status, body } = await listTools({ ...env, MCP_SHARED_TOKEN: 'top-secret' });
+
+		expect(status).toBe(200);
+		const tools = body.result?.tools ?? [];
+		expect(tools[0]?.name).toBe('auto_remember');
+		expect(tools.find((tool) => tool.name === 'auto_remember')).toMatchObject({
+			title: 'Capture durable memory from conversation',
+			annotations: {
+				title: 'Preferred conversation memory capture',
+			},
+		});
+		expect(tools.find((tool) => tool.name === 'auto_remember')?.description).toContain(
+			'Preferred memory-writing tool for chat clients',
+		);
+		expect(tools.find((tool) => tool.name === 'remember')?.description).toContain(
+			'prefer auto_remember instead',
+		);
 	});
 
 	it('auto_remember previews likely memories without storing them in dry-run mode', async () => {

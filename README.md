@@ -36,8 +36,8 @@ The server exposes five MCP tools:
 
 | Tool | Description |
 |------|-------------|
-| `remember` | Save a memory with optional tags, namespace, and source reference |
-| `auto_remember` | Extract likely durable memories from raw conversation text, then preview or store them conservatively |
+| `auto_remember` | Preferred write tool for chat clients; extracts likely durable memories from raw conversation text, then previews or stores them conservatively |
+| `remember` | Save one already-distilled memory with optional tags, namespace, and source reference |
 | `recall` | Search or list memories using semantic + keyword hybrid retrieval |
 | `forget` | Delete a specific memory by namespace and ID |
 | `list_namespaces` | List all namespaces with memory counts |
@@ -181,5 +181,5 @@ That should be treated as a temporary development setting, not normal production
 
 - `recall` blends semantic matches from Vectorize with keyword matches from D1.
 - `forget` now deletes within a namespace, so callers must provide both `namespace` and `id`.
-- `auto_remember` is explicit, not ambient: a client has to call it with conversation text before anything is stored automatically.
+- `auto_remember` is explicit, not ambient: a client has to call it with conversation text before anything is stored automatically, but it is now described as the preferred write path for chat transcripts so clients have a stronger default cue.
 - Input sizes are capped to reduce abuse and accidental AI/storage blowups.
