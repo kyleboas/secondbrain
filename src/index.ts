@@ -566,6 +566,19 @@ function corsHeaders() {
 	};
 }
 
+function getBaseUrl(url: URL) {
+	return `${url.protocol}//${url.host}`;
+}
+
+function getProtectedResourceMetadata(url: URL) {
+	const baseUrl = getBaseUrl(url);
+	return {
+		resource: `${baseUrl}/mcp`,
+		authorization_servers: [baseUrl],
+		bearer_methods_supported: ['header'],
+	};
+}
+
 async function ensureSchema(db: D1Database) {
 	if (!schemaReady) {
 		schemaReady = (async () => {
@@ -650,7 +663,7 @@ async function authorizeRequest(request: Request, env: WorkerEnv) {
 				status: 401,
 				headers: {
 					'Content-Type': 'application/json',
-					'WWW-Authenticate': `Bearer realm="secondbrain", resource_metadata="${new URL('/.well-known/oauth-authorization-server', request.url).toString()}"`,
+					'WWW-Authenticate': `Bearer realm="secondbrain", resource_metadata="${new URL('/.well-known/oauth-protected-resource', request.url).toString()}"`,
 				},
 			},
 		),
@@ -1386,7 +1399,7 @@ export default {
 		}
 
 		if (url.pathname === '/.well-known/oauth-authorization-server') {
-			const base = `${url.protocol}//${url.host}`;
+			const base = getBaseUrl(url);
 			return Response.json(
 				{
 					issuer: base,
@@ -1400,6 +1413,10 @@ export default {
 				},
 				{ headers: corsHeaders() },
 			);
+		}
+
+		if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
+			return Response.json(getProtectedResourceMetadata(url), { headers: corsHeaders() });
 		}
 
 		if (url.pathname === '/oauth/register' && request.method === 'POST') {
