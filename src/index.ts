@@ -1068,11 +1068,107 @@ async function autoRemember(
 	};
 }
 
+async function recallMemories(
+	env: WorkerEnv,
+	input: {
+		namespace?: string;
+		query?: string;
+		tag?: string;
+		limit?: number;
+	},
+) {
+	await ensureSchema(env.MEMORY_DB);
+
+	const normalizedNamespace = validateNamespace(input.namespace);
+	const normalizedQuery = normalizeQuery(input.query);
+	const normalizedTag = normalizeTag(input.tag);
+	const safeLimit = input.limit ?? 10;
+	let results: MemoryRow[] = [];
+	let retrievalMode = 'recent';
+	let warnings: string[] = [];
+
+	if (normalizedQuery.length === 0) {
+		results = await queryRecentMemories(env, normalizedNamespace, normalizedTag, safeLimit);
+	} else {
+		retrievalMode = 'hybrid';
+
+		const keywordResults = await queryKeywordMemories(
+			env,
+			normalizedNamespace,
+			normalizedQuery,
+			normalizedTag,
+			safeLimit,
+		);
+
+		try {
+			const semanticResults = await querySemanticMemories(
+				env,
+				normalizedNamespace,
+				normalizedQuery,
+				normalizedTag,
+				safeLimit,
+			);
+			results = uniqueById([...semanticResults, ...keywordResults]).slice(0, safeLimit);
+		} catch (error) {
+			retrievalMode = 'keyword';
+			warnings = [error instanceof Error ? error.message : String(error)];
+			results = keywordResults;
+		}
+	}
+
+	return {
+		ok: true,
+		namespace: normalizedNamespace,
+		retrievalMode,
+		count: results.length,
+		items: results.map(serializeMemory),
+		...(warnings.length > 0 ? { warnings } : {}),
+	};
+}
+
 function createServer(env: WorkerEnv) {
 	const server = new McpServer({
 		name: 'cloudflare-memory-mcp',
 		version: '0.1.0',
 	});
+
+	server.registerTool(
+		'lookup_memory',
+		{
+			title: 'Check saved memory before answering',
+			description:
+				'Preferred memory lookup tool for chat clients. Use this before answering when the latest user message may depend on saved preferences, identity details, goals, constraints, or project context. Pass the latest user request as query and use the results only when they are relevant.',
+			inputSchema: {
+				namespace: z.string().optional(),
+				query: z.string().min(1),
+				limit: z.number().int().min(1).max(12).optional(),
+			},
+			annotations: {
+				title: 'Preferred memory lookup',
+				readOnlyHint: true,
+				idempotentHint: true,
+			},
+		},
+		async ({ namespace, query, limit }) => {
+			const result = await recallMemories(env, { namespace, query, limit: limit ?? 6 });
+
+			return {
+				content: [
+					{
+						type: 'text',
+						text: JSON.stringify(
+							{
+								...result,
+								guidance: 'Use only the memories that are clearly relevant to the current user request. Ignore unrelated matches.',
+							},
+							null,
+							2,
+						),
+					},
+				],
+			};
+		},
+	);
 
 	server.registerTool(
 		'auto_remember',
@@ -1143,71 +1239,31 @@ function createServer(env: WorkerEnv) {
 		},
 	);
 
-	server.tool(
+	server.registerTool(
 		'recall',
-		'Search shared memories inside a namespace by keyword or tag. Leave query empty to get the latest memories.',
 		{
-			namespace: z.string().optional(),
-			query: z.string().optional(),
-			tag: z.string().optional(),
-			limit: z.number().int().min(1).max(25).optional(),
+			title: 'Search memory directly',
+			description:
+				'Low-level memory search tool for explicit filtering by query or tag. For normal chat context lookup before answering, prefer lookup_memory.',
+			inputSchema: {
+				namespace: z.string().optional(),
+				query: z.string().optional(),
+				tag: z.string().optional(),
+				limit: z.number().int().min(1).max(25).optional(),
+			},
+			annotations: {
+				title: 'Direct memory search',
+				readOnlyHint: true,
+				idempotentHint: true,
+			},
 		},
-			async ({ namespace, query, tag, limit }) => {
-				await ensureSchema(env.MEMORY_DB);
-
-				const normalizedNamespace = validateNamespace(namespace);
-				const normalizedQuery = normalizeQuery(query);
-				const normalizedTag = normalizeTag(tag);
-				const safeLimit = limit ?? 10;
-				let results: MemoryRow[] = [];
-				let retrievalMode = 'recent';
-			let warnings: string[] = [];
-
-			if (normalizedQuery.length === 0) {
-				results = await queryRecentMemories(env, normalizedNamespace, normalizedTag, safeLimit);
-			} else {
-				retrievalMode = 'hybrid';
-
-				const keywordResults = await queryKeywordMemories(
-					env,
-					normalizedNamespace,
-					normalizedQuery,
-					normalizedTag,
-					safeLimit,
-				);
-
-				try {
-					const semanticResults = await querySemanticMemories(
-						env,
-						normalizedNamespace,
-						normalizedQuery,
-						normalizedTag,
-						safeLimit,
-					);
-					results = uniqueById([...semanticResults, ...keywordResults]).slice(0, safeLimit);
-				} catch (error) {
-					retrievalMode = 'keyword';
-					warnings = [error instanceof Error ? error.message : String(error)];
-					results = keywordResults;
-				}
-			}
-
+		async ({ namespace, query, tag, limit }) => {
+			const result = await recallMemories(env, { namespace, query, tag, limit });
 			return {
 				content: [
 					{
 						type: 'text',
-						text: JSON.stringify(
-							{
-								ok: true,
-								namespace: normalizedNamespace,
-								retrievalMode,
-								count: results.length,
-								items: results.map(serializeMemory),
-								...(warnings.length > 0 ? { warnings } : {}),
-							},
-							null,
-							2,
-						),
+						text: JSON.stringify(result, null, 2),
 					},
 				],
 			};
@@ -1485,8 +1541,8 @@ export default {
 					name: 'cloudflare-memory-mcp',
 					endpoint: '/mcp',
 					authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
-					tools: ['auto_remember', 'remember', 'recall', 'forget', 'list_namespaces'],
-					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. auto_remember is the preferred write tool for raw conversation text.',
+					tools: ['lookup_memory', 'auto_remember', 'remember', 'recall', 'forget', 'list_namespaces'],
+					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. lookup_memory is the preferred read tool before answering, and auto_remember is the preferred write tool for raw conversation text.',
 				});
 			}
 

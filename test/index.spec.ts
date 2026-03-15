@@ -172,27 +172,30 @@ describe('cloudflare-memory-mcp worker', () => {
 	it('advertises auto_remember in service metadata', async () => {
 		const response = await fetchWithEnv('http://example.com/');
 		await expect(response.json()).resolves.toMatchObject({
-			tools: expect.arrayContaining(['auto_remember']),
+			tools: expect.arrayContaining(['lookup_memory', 'auto_remember']),
 		});
 	});
 
-	it('marks auto_remember as the preferred conversation write tool in tools/list', async () => {
+	it('marks lookup_memory as the preferred read tool in tools/list', async () => {
 		const { status, body } = await listTools({ ...env, MCP_SHARED_TOKEN: 'top-secret' });
 
 		expect(status).toBe(200);
 		const tools = body.result?.tools ?? [];
-		expect(tools[0]?.name).toBe('auto_remember');
-		expect(tools.find((tool) => tool.name === 'auto_remember')).toMatchObject({
-			title: 'Capture durable memory from conversation',
+		expect(tools[0]?.name).toBe('lookup_memory');
+		expect(tools.find((tool) => tool.name === 'lookup_memory')).toMatchObject({
+			title: 'Check saved memory before answering',
 			annotations: {
-				title: 'Preferred conversation memory capture',
+				title: 'Preferred memory lookup',
 			},
 		});
+		expect(tools.find((tool) => tool.name === 'lookup_memory')?.description).toContain(
+			'Preferred memory lookup tool for chat clients',
+		);
+		expect(tools.find((tool) => tool.name === 'recall')?.description).toContain(
+			'prefer lookup_memory',
+		);
 		expect(tools.find((tool) => tool.name === 'auto_remember')?.description).toContain(
 			'Preferred memory-writing tool for chat clients',
-		);
-		expect(tools.find((tool) => tool.name === 'remember')?.description).toContain(
-			'prefer auto_remember instead',
 		);
 	});
 
