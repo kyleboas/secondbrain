@@ -53,19 +53,26 @@ jobs:
         run: |
           set -euo pipefail
           db_name="cloudflare-memory-mcp"
-          if npx wrangler d1 info "$db_name" --json > /tmp/d1.json 2>/tmp/d1.err; then
+          npx wrangler d1 list --json > /tmp/d1-list.json
+          if node -e '
+            const fs = require("node:fs");
+            const items = JSON.parse(fs.readFileSync("/tmp/d1-list.json", "utf8"));
+            process.exit(items.some((item) => item.name === process.argv[1]) ? 0 : 1);
+          ' "$db_name"; then
             echo "Using existing D1 database: $db_name"
           else
             echo "Creating D1 database: $db_name"
-            npx wrangler d1 create "$db_name" --json > /tmp/d1.json
+            npx wrangler d1 create "$db_name"
+            npx wrangler d1 list --json > /tmp/d1-list.json
           fi
           db_id="$(node <<'NODE'
           const fs = require('node:fs');
-          const data = JSON.parse(fs.readFileSync('/tmp/d1.json', 'utf8'));
-          const id = data.uuid || data.database_id || data.id || '';
+          const items = JSON.parse(fs.readFileSync('/tmp/d1-list.json', 'utf8'));
+          const match = items.find((item) => item.name === 'cloudflare-memory-mcp');
+          const id = match?.uuid || match?.database_id || match?.id || '';
           if (!id) {
             console.error('Unable to determine D1 database ID from Wrangler output.');
-            console.error(JSON.stringify(data, null, 2));
+            console.error(JSON.stringify(items, null, 2));
             process.exit(1);
           }
           process.stdout.write(id);
