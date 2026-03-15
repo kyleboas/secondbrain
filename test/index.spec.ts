@@ -1,4 +1,4 @@
-import { env, createExecutionContext, waitOnExecutionContext, SELF } from 'cloudflare:test';
+import { createExecutionContext, env, waitOnExecutionContext, SELF } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 import worker from '../src';
 
@@ -16,11 +16,8 @@ describe('cloudflare-memory-mcp worker', () => {
 		});
 	});
 
-	it('returns service metadata at / (integration style)', async () => {
-		const response = await SELF.fetch('http://example.com/');
-		expect(response.status).toBe(200);
-		await expect(response.json()).resolves.toMatchObject({
-			tools: ['remember', 'recall', 'forget', 'list_namespaces'],
-		});
+	it('returns 404 for unknown routes', async () => {
+		const response = await SELF.fetch('http://example.com/nope');
+		expect(response.status).toBe(404);
 	});
 });

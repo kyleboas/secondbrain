@@ -19,6 +19,15 @@
 			"migrations_dir": "migrations"
 		}
 	],
+	"vectorize": [
+		{
+			"binding": "MEMORY_INDEX",
+			"index_name": "cloudflare-memory-index"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
 	"observability": {
 		"enabled": true
 	}
