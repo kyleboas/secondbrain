@@ -115,6 +115,36 @@ Your MCP endpoint is:
 https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
 ```
 
+## 7.5. Set the MCP auth secret
+
+The Worker now expects bearer auth by default.
+
+Add a Worker secret:
+
+```bash
+npx wrangler secret put MCP_SHARED_TOKEN
+```
+
+Clients should send:
+
+```text
+Authorization: Bearer <your-token>
+```
+
+If you intentionally want a public demo deployment, you can opt out with:
+
+```bash
+npx wrangler secret put ALLOW_UNAUTHENTICATED
+```
+
+and set its value to:
+
+```text
+true
+```
+
+Leaving the service unauthenticated is not recommended for normal use.
+
 ## 8. Verify it works
 
 Check the root endpoint:
@@ -145,9 +175,9 @@ If a client does not support remote MCP directly, use a local proxy such as `mcp
 
 ## Current security model
 
-This project is currently public and authless.
+This project now fails closed by default unless `ALLOW_UNAUTHENTICATED=true` is explicitly set.
 
-That means anyone who has the MCP URL can call it unless you add protection in front of it. For production use, put auth in front of `/mcp`, for example with Cloudflare Access or another auth layer.
+That means a normal deployment should require `Authorization: Bearer <token>` on `/mcp`.
 
 ## Troubleshooting
 
@@ -167,5 +197,6 @@ If health fails:
 If an MCP client cannot connect:
 
 - make sure you used the full `/mcp` URL
+- make sure the client is sending `Authorization: Bearer <your-token>`
 - verify the Worker is reachable in a browser
 - try a local MCP proxy if the client does not support remote MCP natively
