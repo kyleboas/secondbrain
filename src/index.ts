@@ -1,9 +1,13 @@
+import { timingSafeEqual } from 'node:crypto';
 import { createMcpHandler } from 'agents/mcp';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { OAuthProvider, type OAuthHelpers } from '@cloudflare/workers-oauth-provider';
 import { z } from 'zod';
 
 const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
 const EMBEDDING_POOLING = 'cls';
+const AUTH_COOKIE_NAME = '__Host-secondbrain-csrf';
+const SHARED_USER_ID = 'shared-password-user';
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS memories (
@@ -31,12 +35,265 @@ type MemoryRow = {
 };
 
 type WorkerEnv = {
-	MEMORY_DB: D1Database;
 	AI: Ai;
+	MEMORY_DB: D1Database;
 	MEMORY_INDEX: VectorizeIndex;
+	OAUTH_KV: KVNamespace;
+	OAUTH_PROVIDER: OAuthHelpers;
+	SHARED_PASSWORD: string;
+};
+
+type ClientInfo = {
+	clientId: string;
+	clientName?: string;
+	clientUri?: string;
+	logoUri?: string;
 };
 
 let schemaReady: Promise<void> | undefined;
+
+function constantTimeEqual(a: string, b: string) {
+	const aBytes = Buffer.from(a);
+	const bBytes = Buffer.from(b);
+	if (aBytes.length !== bBytes.length) {
+		return false;
+	}
+	return timingSafeEqual(aBytes, bBytes);
+}
+
+function escapeHtml(value: string) {
+	return value
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&#039;');
+}
+
+function sanitizeUrl(value?: string) {
+	if (!value) {
+		return '';
+	}
+
+	try {
+		const url = new URL(value);
+		return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : '';
+	} catch {
+		return '';
+	}
+}
+
+function getCookieValue(request: Request, name: string) {
+	const cookieHeader = request.headers.get('cookie');
+	if (!cookieHeader) {
+		return '';
+	}
+
+	for (const item of cookieHeader.split(';')) {
+		const [cookieName, ...rest] = item.trim().split('=');
+		if (cookieName === name) {
+			return rest.join('=');
+		}
+	}
+
+	return '';
+}
+
+function issueCsrfCookie(token: string) {
+	return `${AUTH_COOKIE_NAME}=${token}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600`;
+}
+
+function clearCsrfCookie() {
+	return `${AUTH_COOKIE_NAME}=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0`;
+}
+
+function buildHtmlHeaders(setCookie?: string) {
+	const contentSecurityPolicy = [
+		"default-src 'none'",
+		"style-src 'unsafe-inline'",
+		"img-src https:",
+		"form-action 'self'",
+		"frame-ancestors 'none'",
+		"base-uri 'self'",
+		"connect-src 'self'",
+	].join('; ');
+
+	const headers = new Headers({
+		'content-security-policy': contentSecurityPolicy,
+		'content-type': 'text/html; charset=utf-8',
+		'x-content-type-options': 'nosniff',
+		'x-frame-options': 'DENY',
+	});
+
+	if (setCookie) {
+		headers.set('set-cookie', setCookie);
+	}
+
+	return headers;
+}
+
+function renderAuthorizePage(request: Request, client: ClientInfo, requestedScopes: string[], csrfToken: string, error?: string) {
+	const url = new URL(request.url);
+	const safeName = escapeHtml(client.clientName?.trim() || 'MCP Client');
+	const safeClientId = escapeHtml(client.clientId);
+	const safeClientUri = sanitizeUrl(client.clientUri);
+	const scopeList = requestedScopes.length > 0 ? requestedScopes.map(escapeHtml).join(', ') : 'none';
+	const errorHtml = error ? `<p class="error">${escapeHtml(error)}</p>` : '';
+	const clientUriHtml = safeClientUri
+		? `<p><strong>Website</strong><br /><a href="${escapeHtml(safeClientUri)}" target="_blank" rel="noreferrer">${escapeHtml(safeClientUri)}</a></p>`
+		: '';
+
+	const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Authorize ${safeName}</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background: #f3efe6;
+        color: #1e1b16;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top, rgba(219, 166, 108, 0.22), transparent 34%),
+          linear-gradient(180deg, #f6f1e8 0%, #efe5d6 100%);
+        padding: 24px;
+      }
+      .card {
+        width: min(100%, 480px);
+        background: rgba(255, 252, 247, 0.95);
+        border: 1px solid rgba(71, 49, 22, 0.16);
+        border-radius: 24px;
+        box-shadow: 0 18px 48px rgba(58, 37, 15, 0.15);
+        padding: 28px;
+      }
+      .eyebrow {
+        display: inline-block;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: #f1dfc4;
+        color: #6b4a22;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      h1 {
+        margin: 14px 0 8px;
+        font-size: 30px;
+        line-height: 1.1;
+      }
+      p {
+        margin: 0 0 14px;
+        color: #5b4b35;
+      }
+      .panel {
+        background: #fbf6ee;
+        border: 1px solid rgba(71, 49, 22, 0.12);
+        border-radius: 18px;
+        padding: 16px;
+        margin: 18px 0;
+      }
+      .panel p {
+        margin: 0 0 10px;
+      }
+      .panel p:last-child {
+        margin-bottom: 0;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 8px;
+      }
+      input[type="password"] {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 14px;
+        border: 1px solid rgba(71, 49, 22, 0.24);
+        padding: 14px 16px;
+        font-size: 16px;
+        background: #fff;
+      }
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 20px;
+      }
+      button {
+        border: 0;
+        border-radius: 14px;
+        cursor: pointer;
+        font-size: 15px;
+        font-weight: 700;
+        padding: 14px 18px;
+      }
+      .approve {
+        flex: 1;
+        background: #1f6f4a;
+        color: #fffaf1;
+      }
+      .cancel {
+        background: #eadfce;
+        color: #4e3d28;
+      }
+      .error {
+        color: #9b2226;
+        background: rgba(155, 34, 38, 0.08);
+        border: 1px solid rgba(155, 34, 38, 0.18);
+        border-radius: 12px;
+        padding: 12px 14px;
+      }
+      a {
+        color: #6b4a22;
+      }
+    </style>
+  </head>
+  <body>
+    <form class="card" method="POST" action="/authorize?${escapeHtml(url.searchParams.toString())}">
+      <span class="eyebrow">Protected Memory</span>
+      <h1>${safeName} wants access</h1>
+      <p>Enter your shared password to connect this MCP client to your secondbrain memory server.</p>
+      ${errorHtml}
+      <div class="panel">
+        <p><strong>Client ID</strong><br />${safeClientId}</p>
+        ${clientUriHtml}
+        <p><strong>Requested scopes</strong><br />${scopeList}</p>
+      </div>
+      <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}" />
+      <label for="password">Shared password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <div class="actions">
+        <button class="cancel" type="button" onclick="history.back()">Cancel</button>
+        <button class="approve" type="submit">Approve connection</button>
+      </div>
+    </form>
+  </body>
+</html>`;
+
+	return new Response(html, { headers: buildHtmlHeaders(issueCsrfCookie(csrfToken)) });
+}
+
+function renderInfoPage() {
+	return Response.json({
+		name: 'cloudflare-memory-mcp',
+		endpoint: '/mcp',
+		auth: {
+			type: 'oauth2.1+shared-password',
+			authorizeEndpoint: '/authorize',
+			tokenEndpoint: '/oauth/token',
+			clientRegistrationEndpoint: '/oauth/register',
+		},
+		tools: ['remember', 'recall', 'forget', 'list_namespaces'],
+		note: 'Shared memory uses OAuth before granting MCP access. D1 stores canonical records and Vectorize handles semantic recall.',
+	});
+}
 
 function normalizeNamespace(value?: string) {
 	const trimmed = value?.trim().toLowerCase();
@@ -191,7 +448,7 @@ async function querySemanticMemories(env: WorkerEnv, namespace: string, query: s
 function createServer(env: WorkerEnv) {
 	const server = new McpServer({
 		name: 'cloudflare-memory-mcp',
-		version: '0.1.0',
+		version: '0.2.0',
 	});
 
 	server.tool(
@@ -412,25 +669,29 @@ function createServer(env: WorkerEnv) {
 	return server;
 }
 
-export default {
-	async fetch(request, env: WorkerEnv, ctx): Promise<Response> {
+const apiHandler = {
+	async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContext) {
+		const server = createServer(env);
+		return createMcpHandler(server)(request, env, ctx);
+	},
+};
+
+const defaultHandler = {
+	async fetch(request: Request, env: WorkerEnv) {
 		const url = new URL(request.url);
 
-		if (url.pathname === '/mcp') {
-			const server = createServer(env);
-			return createMcpHandler(server)(request, env, ctx);
+		if (url.pathname === '/') {
+			return renderInfoPage();
 		}
 
 		if (url.pathname === '/health') {
 			try {
 				await ensureSchema(env.MEMORY_DB);
-				const row = await env.MEMORY_DB.prepare('SELECT COUNT(*) AS count FROM memories').first<{ count: number }>();
-				const vectorIndex = await env.MEMORY_INDEX.describe();
+				await env.MEMORY_INDEX.describe();
 				return Response.json({
 					ok: true,
-					memoryCount: Number(row?.count ?? 0),
-					vectorCount: vectorIndex.vectorsCount,
-					vectorDimensions: 'dimensions' in vectorIndex.config ? vectorIndex.config.dimensions : vectorIndex.config.preset,
+					authRequired: true,
+					authorizeEndpoint: '/authorize',
 					embeddingModel: EMBEDDING_MODEL,
 				});
 			} catch (error) {
@@ -444,15 +705,87 @@ export default {
 			}
 		}
 
-		if (url.pathname === '/') {
-			return Response.json({
-				name: 'cloudflare-memory-mcp',
-				endpoint: '/mcp',
-				tools: ['remember', 'recall', 'forget', 'list_namespaces'],
-				note: 'Shared memory is hybrid: D1 stores the canonical records and Vectorize handles semantic recall.',
+		if (url.pathname !== '/authorize') {
+			return new Response('Not Found', { status: 404 });
+		}
+
+		if (!env.SHARED_PASSWORD) {
+			return new Response('Server misconfigured: missing SHARED_PASSWORD', { status: 500 });
+		}
+
+		let oauthRequest;
+		try {
+			oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+		} catch (error) {
+			return new Response(error instanceof Error ? error.message : 'Invalid authorization request', { status: 400 });
+		}
+
+		const client = (await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId)) as ClientInfo | undefined;
+
+		if (!client) {
+			return new Response('Invalid client_id', { status: 400 });
+		}
+
+		if (request.method === 'GET') {
+			const csrfToken = crypto.randomUUID();
+			return renderAuthorizePage(request, client, oauthRequest.scope, csrfToken);
+		}
+
+		if (request.method !== 'POST') {
+			return new Response('Method Not Allowed', {
+				status: 405,
+				headers: { allow: 'GET, POST' },
 			});
 		}
 
-		return new Response('Not Found', { status: 404 });
+		const formData = await request.formData();
+		const csrfFromForm = String(formData.get('csrf_token') || '');
+		const csrfFromCookie = getCookieValue(request, AUTH_COOKIE_NAME);
+		if (!csrfFromForm || !csrfFromCookie || !constantTimeEqual(csrfFromForm, csrfFromCookie)) {
+			return new Response('Invalid CSRF token', {
+				status: 400,
+				headers: buildHtmlHeaders(clearCsrfCookie()),
+			});
+		}
+
+		const password = String(formData.get('password') || '');
+		if (!constantTimeEqual(password, env.SHARED_PASSWORD)) {
+			const csrfToken = crypto.randomUUID();
+			return renderAuthorizePage(request, client, oauthRequest.scope, csrfToken, 'Wrong password.');
+		}
+
+		const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+			request: oauthRequest,
+			userId: SHARED_USER_ID,
+			metadata: {
+				clientName: client.clientName || 'Unknown Client',
+				label: 'Shared password access',
+			},
+			scope: oauthRequest.scope,
+			props: {
+				authMethod: 'shared-password',
+				userId: SHARED_USER_ID,
+			},
+		});
+
+		return new Response(null, {
+			status: 302,
+			headers: {
+				location: redirectTo,
+				'set-cookie': clearCsrfCookie(),
+			},
+		});
 	},
-} satisfies ExportedHandler<WorkerEnv>;
+};
+
+export default new OAuthProvider<WorkerEnv>({
+	accessTokenTTL: 3600,
+	allowPlainPKCE: false,
+	apiHandler,
+	apiRoute: '/mcp',
+	authorizeEndpoint: '/authorize',
+	clientRegistrationEndpoint: '/oauth/register',
+	defaultHandler,
+	refreshTokenTTL: 2592000,
+	tokenEndpoint: '/oauth/token',
+});

@@ -18,6 +18,7 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+      SHARED_PASSWORD: ${{ secrets.SHARED_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,14 +31,14 @@ jobs:
         run: |
           set -euo pipefail
           missing=()
-          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID SHARED_PASSWORD; do
             if [ -z "${!name:-}" ]; then
               missing+=("$name")
             fi
           done
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "Missing required GitHub secret or variable: ${missing[*]}" >&2
-            echo "Set CLOUDFLARE_API_TOKEN as a secret and CLOUDFLARE_ACCOUNT_ID as a secret or variable." >&2
+            echo "Set CLOUDFLARE_API_TOKEN and SHARED_PASSWORD as secrets, and set CLOUDFLARE_ACCOUNT_ID as a secret or variable." >&2
             exit 1
           fi
       - name: Validate Cloudflare token
@@ -45,9 +46,50 @@ jobs:
         run: |
           set -euo pipefail
           if ! npx wrangler whoami; then
-            echo "Cloudflare authentication failed. The token usually needs Workers Scripts:Edit, D1:Edit, Vectorize:Edit, and Account:Read on the target account." >&2
+            echo "Cloudflare authentication failed. The token usually needs Workers Scripts:Edit, Workers KV Storage:Edit, D1:Edit, Vectorize:Edit, and Account:Read on the target account." >&2
             exit 1
           fi
+      - name: Ensure OAuth KV namespace exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace_title="cloudflare-memory-mcp-oauth"
+          api_url="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces"
+          auth_header="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+
+          curl -fsS -H "$auth_header" "$api_url?per_page=100" > /tmp/kv-list.json
+          namespace_id="$(node <<'NODE'
+          const fs = require('node:fs');
+          const payload = JSON.parse(fs.readFileSync('/tmp/kv-list.json', 'utf8'));
+          const items = Array.isArray(payload.result) ? payload.result : payload;
+          const match = items.find((item) => item.title === 'cloudflare-memory-mcp-oauth');
+          process.stdout.write(match?.id || '');
+          NODE
+          )"
+
+          if [ -z "$namespace_id" ]; then
+            echo "Creating OAuth KV namespace: $namespace_title"
+            curl -fsS -X POST \
+              -H "$auth_header" \
+              -H "Content-Type: application/json" \
+              --data "{\"title\":\"$namespace_title\"}" \
+              "$api_url" > /tmp/kv-create.json
+            namespace_id="$(node <<'NODE'
+            const fs = require('node:fs');
+            const payload = JSON.parse(fs.readFileSync('/tmp/kv-create.json', 'utf8'));
+            process.stdout.write(payload.result?.id || '');
+            NODE
+            )"
+          else
+            echo "Using existing OAuth KV namespace: $namespace_title"
+          fi
+
+          if [ -z "$namespace_id" ]; then
+            echo "Unable to determine OAuth KV namespace ID." >&2
+            exit 1
+          fi
+
+          echo "CLOUDFLARE_OAUTH_KV_ID=$namespace_id" >> "$GITHUB_ENV"
       - name: Ensure D1 database exists
         shell: bash
         run: |
@@ -90,7 +132,7 @@ jobs:
             echo "Creating Vectorize index: $index_name"
             npx wrangler vectorize create "$index_name" --dimensions=768 --metric=cosine --json > /tmp/vectorize.json
           fi
-      - name: Inject D1 database ID into wrangler.jsonc
+      - name: Inject Cloudflare binding IDs into wrangler.jsonc
         shell: bash
         run: |
           set -euo pipefail
@@ -98,16 +140,21 @@ jobs:
           const fs = require('node:fs');
           const path = 'wrangler.jsonc';
           const dbId = process.env.CLOUDFLARE_D1_DATABASE_ID;
+          const oauthKvId = process.env.CLOUDFLARE_OAUTH_KV_ID;
           const current = fs.readFileSync(path, 'utf8');
-          const next = current.replace(
-            /"database_id":\s*"[^"]+"/,
-            `"database_id": "${dbId}"`,
-          );
+          const next = current
+            .replace('"database_id": "00000000-0000-0000-0000-000000000000"', `"database_id": "${dbId}"`)
+            .replace('"id": "00000000000000000000000000000000"', `"id": "${oauthKvId}"`);
           if (current === next) {
-            throw new Error('Could not find d1_databases[0].database_id in wrangler.jsonc');
+            throw new Error('Could not inject Cloudflare binding IDs into wrangler.jsonc');
           }
           fs.writeFileSync(path, next);
           NODE
+      - name: Update SHARED_PASSWORD worker secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$SHARED_PASSWORD" | npx wrangler secret put SHARED_PASSWORD
       - name: Apply D1 migrations (remote)
         run: npx wrangler d1 migrations apply cloudflare-memory-mcp --remote
       - name: Deploy to Cloudflare

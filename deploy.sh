@@ -5,6 +5,13 @@ echo "🚀 Cloudflare Memory MCP Deployment Script"
 echo "=========================================="
 echo ""
 
+if [ -z "$SHARED_PASSWORD" ]; then
+    echo "❌ SHARED_PASSWORD is not set."
+    echo "   Export it before running this script, for example:"
+    echo "   export SHARED_PASSWORD='choose-a-long-random-password'"
+    exit 1
+fi
+
 # Check if logged in
 echo "Checking Cloudflare authentication..."
 if ! wrangler whoami &>/dev/null; then
@@ -14,6 +21,14 @@ if ! wrangler whoami &>/dev/null; then
 fi
 echo "✅ Authenticated with Cloudflare"
 echo ""
+
+# Create OAuth KV Namespace if config still has placeholder
+if grep -q '00000000000000000000000000000000' wrangler.jsonc; then
+    echo "🔐 Creating OAuth KV namespace 'cloudflare-memory-mcp-oauth'..."
+    wrangler kv namespace create cloudflare-memory-mcp-oauth --binding OAUTH_KV --update-config
+    echo "✅ OAuth KV namespace ready"
+    echo ""
+fi
 
 # Create D1 Database
 echo "📦 Creating D1 database 'cloudflare-memory-mcp'..."
@@ -64,6 +79,11 @@ fi
 echo ""
 echo "🗄️  Applying D1 migrations..."
 wrangler d1 migrations apply cloudflare-memory-mcp --local=false || true
+
+# Update Worker Secret
+echo ""
+echo "🔒 Updating SHARED_PASSWORD worker secret..."
+printf '%s' "$SHARED_PASSWORD" | wrangler secret put SHARED_PASSWORD
 
 # Deploy
 echo ""
