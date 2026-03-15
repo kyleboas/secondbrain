@@ -2,6 +2,47 @@
 
 # secondbrain
 
+A shared memory server for your AI tools. Built on [Cloudflare Workers](https://workers.cloudflare.com/) and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), secondbrain gives ChatGPT, Claude, Gemini, Zo, and any other MCP-compatible client a single place to store and retrieve memories -- so context learned in one tool is available everywhere.
+
+### Why
+
+AI assistants forget everything between conversations. When you use multiple tools the problem multiplies: insights from Claude never reach ChatGPT, notes saved in Gemini stay locked there, and you end up repeating yourself everywhere. secondbrain solves this by providing a unified, always-on memory layer that every tool can read from and write to.
+
+### How it works
+
+secondbrain exposes an MCP endpoint (`POST /mcp`) using Cloudflare's remote transport. Under the hood it uses a **hybrid storage architecture** that combines structured records with semantic search:
+
+| Layer | Service | Role |
+|-------|---------|------|
+| Canonical store | Cloudflare D1 (SQLite) | Stores every memory with its metadata, tags, and namespace |
+| Semantic index | Cloudflare Vectorize | Stores vector embeddings for meaning-based recall |
+| Embedding model | Workers AI (`@cf/baai/bge-base-en-v1.5`) | Generates 768-dimension embeddings at the edge |
+
+When you **remember** something, it is written to both D1 and Vectorize. When you **recall**, the server blends semantic matches (by meaning) with keyword matches (by text) and returns the most relevant results. This means you can search for concepts, not just exact words.
+
+### Key features
+
+- **Cross-tool memory** -- memories saved by one AI client are instantly available to all others
+- **Hybrid recall** -- combines semantic similarity search with keyword ranking for accurate retrieval
+- **Namespace isolation** -- organize memories into separate namespaces (e.g. `work`, `personal`, `project:atlas`)
+- **Tagging** -- attach up to 16 tags per memory for filtering and categorization
+- **Secure by default** -- bearer-token authentication with constant-time comparison; fails closed when no token is set
+- **Graceful degradation** -- falls back to keyword-only search if the semantic index is unavailable
+- **Edge-native** -- runs entirely on Cloudflare's edge network with no origin server required
+
+### Tools
+
+The server exposes four MCP tools:
+
+| Tool | Description |
+|------|-------------|
+| `remember` | Save a memory with optional tags, namespace, and source reference |
+| `recall` | Search or list memories using semantic + keyword hybrid retrieval |
+| `forget` | Delete a specific memory by namespace and ID |
+| `list_namespaces` | List all namespaces with memory counts |
+
+---
+
 License: MIT. See `LICENSE`.
 
 For a step-by-step self-setup guide, see `SETUP.md`.
@@ -15,16 +56,6 @@ Run the deployment script (requires Cloudflare login):
 ```
 
 Or follow the manual steps below.
-
-This repo contains a Cloudflare Workers MCP server that gives multiple AI tools a shared memory.
-
-The Worker exposes `POST /mcp` using Cloudflare's remote MCP transport. Memory is hybrid:
-
-- `D1` stores the canonical records
-- `Vectorize` stores embeddings for semantic recall
-- `Workers AI` generates embeddings with `@cf/baai/bge-base-en-v1.5`
-
-That lets ChatGPT, Claude, Gemini, Zo, or any other MCP client share the same namespace and retrieve memories by meaning, not just exact keywords.
 
 ## Tools
 
