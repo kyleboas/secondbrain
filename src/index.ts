@@ -5,20 +5,20 @@ import { z } from 'zod';
 const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
 const EMBEDDING_POOLING = 'cls';
 
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS memories (
-	id TEXT PRIMARY KEY,
-	namespace TEXT NOT NULL,
-	content TEXT NOT NULL,
-	tags TEXT NOT NULL DEFAULT '',
-	source TEXT,
-	created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS idx_memories_namespace_created_at
-ON memories(namespace, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_memories_tags
-ON memories(tags);
-`;
+const SCHEMA_STATEMENTS = [
+	`CREATE TABLE IF NOT EXISTS memories (
+		id TEXT PRIMARY KEY,
+		namespace TEXT NOT NULL,
+		content TEXT NOT NULL,
+		tags TEXT NOT NULL DEFAULT '',
+		source TEXT,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_namespace_created_at
+	ON memories(namespace, created_at DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_memories_tags
+	ON memories(tags)`,
+];
 
 type MemoryRow = {
 	id: string;
@@ -33,7 +33,7 @@ type MemoryRow = {
 type WorkerEnv = {
 	MEMORY_DB: D1Database;
 	AI: Ai;
-	MEMORY_INDEX: VectorizeIndex;
+	MEMORY_INDEX: VectorizeIndex | Vectorize;
 };
 
 let schemaReady: Promise<void> | undefined;
@@ -82,12 +82,34 @@ function uniqueById(rows: MemoryRow[]) {
 	});
 }
 
+function getVectorizeHealthDetails(indexDetails: Awaited<ReturnType<VectorizeIndex['describe']>> | Awaited<ReturnType<Vectorize['describe']>>) {
+	const vectorCount =
+		'vectorsCount' in indexDetails
+			? indexDetails.vectorsCount
+			: indexDetails.vectorCount;
+
+	const vectorDimensions =
+		'dimensions' in indexDetails
+			? indexDetails.dimensions
+			: 'dimensions' in indexDetails.config
+				? indexDetails.config.dimensions
+				: indexDetails.config.preset;
+
+	return { vectorCount, vectorDimensions };
+}
+
 async function ensureSchema(db: D1Database) {
 	if (!schemaReady) {
-		schemaReady = db.exec(SCHEMA_SQL).then(() => undefined).catch((error) => {
-			schemaReady = undefined;
-			throw error;
-		});
+		schemaReady = (async () => {
+			try {
+				for (const statement of SCHEMA_STATEMENTS) {
+					await db.prepare(statement).run();
+				}
+			} catch (error) {
+				schemaReady = undefined;
+				throw error;
+			}
+		})();
 	}
 	await schemaReady;
 }
@@ -426,11 +448,12 @@ export default {
 				await ensureSchema(env.MEMORY_DB);
 				const row = await env.MEMORY_DB.prepare('SELECT COUNT(*) AS count FROM memories').first<{ count: number }>();
 				const vectorIndex = await env.MEMORY_INDEX.describe();
+				const { vectorCount, vectorDimensions } = getVectorizeHealthDetails(vectorIndex);
 				return Response.json({
 					ok: true,
 					memoryCount: Number(row?.count ?? 0),
-					vectorCount: vectorIndex.vectorsCount,
-					vectorDimensions: 'dimensions' in vectorIndex.config ? vectorIndex.config.dimensions : vectorIndex.config.preset,
+					vectorCount,
+					vectorDimensions,
 					embeddingModel: EMBEDDING_MODEL,
 				});
 			} catch (error) {
