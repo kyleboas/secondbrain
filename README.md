@@ -1,5 +1,15 @@
 # secondbrain
 
+## Quick Deploy
+
+Run the deployment script (requires Cloudflare login):
+
+```bash
+./deploy.sh
+```
+
+Or follow the manual steps below.
+
 This repo contains a Cloudflare Workers MCP server that gives multiple AI tools a shared memory.
 
 The Worker exposes `POST /mcp` using Cloudflare's remote MCP transport. Memory is hybrid:
