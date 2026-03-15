@@ -32,11 +32,12 @@ When you **remember** something, it is written to both D1 and Vectorize. When yo
 
 ### Tools
 
-The server exposes four MCP tools:
+The server exposes five MCP tools:
 
 | Tool | Description |
 |------|-------------|
 | `remember` | Save a memory with optional tags, namespace, and source reference |
+| `auto_remember` | Extract likely durable memories from raw conversation text, then preview or store them conservatively |
 | `recall` | Search or list memories using semantic + keyword hybrid retrieval |
 | `forget` | Delete a specific memory by namespace and ID |
 | `list_namespaces` | List all namespaces with memory counts |
@@ -60,6 +61,7 @@ Or follow the manual steps below.
 ## Tools
 
 - `remember`: save a memory in a namespace
+- `auto_remember`: extract likely memories from conversation text
 - `recall`: search or list memories in a namespace
 - `forget`: delete a memory by namespace and id
 - `list_namespaces`: see what namespaces exist
@@ -179,4 +181,5 @@ That should be treated as a temporary development setting, not normal production
 
 - `recall` blends semantic matches from Vectorize with keyword matches from D1.
 - `forget` now deletes within a namespace, so callers must provide both `namespace` and `id`.
+- `auto_remember` is explicit, not ambient: a client has to call it with conversation text before anything is stored automatically.
 - Input sizes are capped to reduce abuse and accidental AI/storage blowups.

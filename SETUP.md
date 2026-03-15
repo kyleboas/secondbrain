@@ -22,7 +22,7 @@ The Worker uses three Cloudflare services for hybrid memory storage:
 | Vectorize | `MEMORY_INDEX` | Vector index for semantic similarity search (768-dim, cosine) |
 | Workers AI | `AI` | Generates embeddings with `@cf/baai/bge-base-en-v1.5` |
 
-Once deployed, any MCP client can `remember` facts, `recall` them by meaning or keyword, `forget` specific entries, and `list_namespaces` to see how memories are organized.
+Once deployed, any MCP client can `remember` facts, `auto_remember` likely long-lived facts from raw conversation text, `recall` memories by meaning or keyword, `forget` specific entries, and `list_namespaces` to see how memories are organized.
 
 ## Before you start
 
@@ -219,6 +219,17 @@ Authorization: Bearer <your-MCP_SHARED_TOKEN>
 ```
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
+
+### 9.4. Using `auto_remember`
+
+`auto_remember` is the tool to use when you want a client to save likely durable memories from a block of conversation text.
+
+Important:
+
+- it is explicit, not ambient — nothing is stored unless the client calls `auto_remember`
+- it works best on plain conversation transcripts, summaries, or meeting notes
+- it uses conservative heuristics and skips exact duplicate memory content inside the same namespace
+- use `dryRun=true` first if you want to preview what would be stored
 
 ## Current security model
 
