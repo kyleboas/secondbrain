@@ -224,6 +224,18 @@ Authorization: Bearer <your-MCP_SHARED_TOKEN>
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
+For first-party clients you control, like `blob`, prefer the direct JSON API instead:
+
+| Endpoint | Method |
+|---|---|
+| `/api/memory/lookup` | `POST` |
+| `/api/memory/remember` | `POST` |
+| `/api/memory/auto-remember` | `POST` |
+| `/api/memory/forget` | `POST` |
+| `/api/memory/namespaces` | `GET` |
+
+See `ARCHITECTURE.md` for the client-by-client integration plan.
+
 ### 9.4. Using `lookup_memory`
 
 `lookup_memory` is the tool to use when a client should check saved context before answering a user request.

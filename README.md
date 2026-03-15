@@ -48,6 +48,7 @@ The server exposes six MCP tools:
 License: MIT. See `LICENSE`.
 
 For a step-by-step self-setup guide, see `SETUP.md`.
+For the multi-client architecture and direct `blob` integration plan, see `ARCHITECTURE.md`.
 
 ## Quick Deploy
 
@@ -152,6 +153,8 @@ https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
 Paste that URL into Claude (`Settings → Connectors`) or ChatGPT (custom connector settings). The client will discover OAuth automatically, redirect you to a login page, and store the access token — no manual token copying required.
 
 For scripts and local proxies that set headers directly, the raw `MCP_SHARED_TOKEN` value still works as a bearer token.
+
+For first-party adapters you control, like `blob`, use the direct JSON API under `/api/memory/*` instead of MCP tool calls.
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
