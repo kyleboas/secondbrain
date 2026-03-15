@@ -16,6 +16,10 @@ const MAX_AUTO_REMEMBER_ITEMS = 8;
 const MAX_REDIRECT_URI_LENGTH = 2_048;
 const MAX_REDIRECT_URI_COUNT = 10;
 const MAX_CLIENT_NAME_LENGTH = 128;
+const RETRIEVE_TIMEOUT_MS = 3_000;
+const TRIVIAL_MAX_LENGTH = 20;
+const TRIVIAL_PATTERNS = /^(hi|hey|hello|thanks|thank you|ok|okay|yes|no|sure|cool|got it|bye|yep|nope|lol|haha|wow|nice|great|good|fine|right|yea|yeah|nah|k|ty|thx|np)[\s!?.]*$/i;
+
 const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9:/_-]*$/;
 const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -1126,6 +1130,119 @@ async function recallMemories(
 	};
 }
 
+function isTrivialMessage(message: string) {
+	const trimmed = message.trim();
+	return trimmed.length <= TRIVIAL_MAX_LENGTH && TRIVIAL_PATTERNS.test(trimmed);
+}
+
+async function handleRetrieve(request: Request, env: WorkerEnv): Promise<Response> {
+	if (request.method === 'OPTIONS') {
+		return new Response(null, { status: 204, headers: corsHeaders() });
+	}
+
+	if (request.method !== 'POST') {
+		return Response.json(
+			{ ok: false, error: 'Method not allowed. Use POST.' },
+			{ status: 405, headers: corsHeaders() },
+		);
+	}
+
+	const auth = await authorizeRequest(request, env);
+	if (!auth.ok) {
+		return auth.response;
+	}
+
+	let body: { message: string; namespace?: string; limit?: number };
+	try {
+		body = await request.json() as typeof body;
+	} catch {
+		return Response.json(
+			{ ok: false, error: 'Invalid JSON body. Expected { "message": "..." }.' },
+			{ status: 400, headers: corsHeaders() },
+		);
+	}
+
+	if (!body.message || typeof body.message !== 'string' || body.message.trim().length === 0) {
+		return Response.json(
+			{ ok: false, error: '"message" is required and must be a non-empty string.' },
+			{ status: 400, headers: corsHeaders() },
+		);
+	}
+
+	const message = body.message.trim();
+
+	// Skip retrieval for trivial messages
+	if (isTrivialMessage(message)) {
+		return Response.json(
+			{
+				ok: true,
+				skipped: true,
+				reason: 'trivial_message',
+				memories: [],
+				context: null,
+			},
+			{ headers: corsHeaders() },
+		);
+	}
+
+	const namespace = body.namespace;
+	const limit = body.limit ?? 6;
+
+	// Retrieve with timeout
+	let result: Awaited<ReturnType<typeof recallMemories>>;
+	try {
+		result = await Promise.race([
+			recallMemories(env, { namespace, query: message, limit }),
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error('retrieval_timeout')), RETRIEVE_TIMEOUT_MS),
+			),
+		]);
+	} catch (error) {
+		if (error instanceof Error && error.message === 'retrieval_timeout') {
+			return Response.json(
+				{
+					ok: true,
+					skipped: true,
+					reason: 'timeout',
+					memories: [],
+					context: null,
+				},
+				{ headers: corsHeaders() },
+			);
+		}
+		return Response.json(
+			{ ok: false, error: error instanceof Error ? error.message : String(error) },
+			{ status: 500, headers: corsHeaders() },
+		);
+	}
+
+	// Format memories into an injectable system context block
+	let context: string | null = null;
+	if (result.items.length > 0) {
+		const memoryLines = result.items.map(
+			(item) => `- ${item.content}${item.tags.length > 0 ? ` [${item.tags.join(', ')}]` : ''}`,
+		);
+		context = [
+			'The following memories were retrieved from the user\'s personal knowledge base. Use only the memories clearly relevant to the current message. Ignore unrelated matches.',
+			'',
+			...memoryLines,
+		].join('\n');
+	}
+
+	return Response.json(
+		{
+			ok: true,
+			skipped: false,
+			retrievalMode: result.retrievalMode,
+			count: result.count,
+			memories: result.items,
+			context,
+			...(result.warnings ? { warnings: result.warnings } : {}),
+		},
+		{ headers: corsHeaders() },
+	);
+}
+
 function createServer(env: WorkerEnv) {
 	const server = new McpServer({
 		name: 'cloudflare-memory-mcp',
@@ -1454,6 +1571,7 @@ async function querySemanticMemories(env: WorkerEnv, namespace: string, query: s
 export const internals = {
 	extractAutoRememberCandidates,
 	autoRemember,
+	isTrivialMessage,
 };
 
 export default {
@@ -1501,6 +1619,10 @@ export default {
 			return handleOAuthToken(request, env);
 		}
 
+		if (url.pathname === '/retrieve') {
+			return handleRetrieve(request, env);
+		}
+
 		if (url.pathname === '/mcp') {
 			if (request.method !== 'OPTIONS') {
 				const auth = await authorizeRequest(request, env);
@@ -1540,9 +1662,10 @@ export default {
 				return Response.json({
 					name: 'cloudflare-memory-mcp',
 					endpoint: '/mcp',
+					retrieveEndpoint: '/retrieve',
 					authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
 					tools: ['lookup_memory', 'auto_remember', 'remember', 'recall', 'forget', 'list_namespaces'],
-					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. lookup_memory is the preferred read tool before answering, and auto_remember is the preferred write tool for raw conversation text.',
+					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. POST /retrieve for automatic pre-generation memory retrieval. lookup_memory is the preferred MCP read tool, and auto_remember is the preferred MCP write tool for raw conversation text.',
 				});
 			}
 

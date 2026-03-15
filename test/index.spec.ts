@@ -384,4 +384,119 @@ describe('cloudflare-memory-mcp worker', () => {
 		const response = await SELF.fetch('http://example.com/nope');
 		expect(response.status).toBe(404);
 	});
+
+	describe('/retrieve endpoint', () => {
+		it('requires authentication', async () => {
+			const response = await fetchWithEnv(
+				'http://example.com/retrieve',
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ message: 'What are my preferences?' }),
+				},
+				{ ...env, MCP_SHARED_TOKEN: 'top-secret' } as TestEnv,
+			);
+			expect(response.status).toBe(401);
+		});
+
+		it('rejects non-POST methods', async () => {
+			const testEnv = createMemoryTestEnv();
+			const response = await fetchWithEnv(
+				'http://example.com/retrieve',
+				{
+					method: 'GET',
+					headers: { Authorization: `Bearer ${testEnv.MCP_SHARED_TOKEN}` },
+				},
+				testEnv,
+			);
+			expect(response.status).toBe(405);
+		});
+
+		it('rejects missing message', async () => {
+			const testEnv = createMemoryTestEnv();
+			const response = await fetchWithEnv(
+				'http://example.com/retrieve',
+				{
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${testEnv.MCP_SHARED_TOKEN}`,
+					},
+					body: JSON.stringify({}),
+				},
+				testEnv,
+			);
+			expect(response.status).toBe(400);
+			await expect(response.json()).resolves.toMatchObject({ ok: false });
+		});
+
+		it('skips retrieval for trivial messages', async () => {
+			const testEnv = createMemoryTestEnv();
+			const response = await fetchWithEnv(
+				'http://example.com/retrieve',
+				{
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${testEnv.MCP_SHARED_TOKEN}`,
+					},
+					body: JSON.stringify({ message: 'hi!' }),
+				},
+				testEnv,
+			);
+			expect(response.status).toBe(200);
+			const body = await response.json() as { ok: boolean; skipped: boolean; reason: string };
+			expect(body.ok).toBe(true);
+			expect(body.skipped).toBe(true);
+			expect(body.reason).toBe('trivial_message');
+		});
+
+		it('retrieves memories for substantive messages', async () => {
+			const testEnv = createMemoryTestEnv();
+			const response = await fetchWithEnv(
+				'http://example.com/retrieve',
+				{
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${testEnv.MCP_SHARED_TOKEN}`,
+					},
+					body: JSON.stringify({ message: 'What are my coding preferences?' }),
+				},
+				testEnv,
+			);
+			expect(response.status).toBe(200);
+			const body = await response.json() as { ok: boolean; skipped: boolean; memories: unknown[] };
+			expect(body.ok).toBe(true);
+			expect(body.skipped).toBe(false);
+			expect(Array.isArray(body.memories)).toBe(true);
+		});
+
+		it('returns CORS headers', async () => {
+			const response = await fetchWithEnv(
+				'http://example.com/retrieve',
+				{ method: 'OPTIONS' },
+				createMemoryTestEnv(),
+			);
+			expect(response.status).toBe(204);
+			expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+		});
+	});
+
+	describe('isTrivialMessage', () => {
+		it('detects trivial greetings', () => {
+			expect(internals.isTrivialMessage('hi')).toBe(true);
+			expect(internals.isTrivialMessage('Hello!')).toBe(true);
+			expect(internals.isTrivialMessage('thanks')).toBe(true);
+			expect(internals.isTrivialMessage('ok')).toBe(true);
+			expect(internals.isTrivialMessage('yep')).toBe(true);
+			expect(internals.isTrivialMessage('  hey  ')).toBe(true);
+		});
+
+		it('passes through substantive messages', () => {
+			expect(internals.isTrivialMessage('What are my preferences?')).toBe(false);
+			expect(internals.isTrivialMessage('Tell me about my project')).toBe(false);
+			expect(internals.isTrivialMessage('How should I structure the API?')).toBe(false);
+		});
+	});
 });
