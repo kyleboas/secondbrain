@@ -1,20 +1,28 @@
 # secondbrain setup
 
-This guide shows how to set up and deploy the Cloudflare memory MCP server yourself.
+This guide walks you through deploying your own instance of **secondbrain** -- a shared memory server that lets ChatGPT, Claude, Gemini, Zo, and any other MCP-compatible AI tool store and retrieve memories from one place. Memories are searched by meaning, not just keywords, so context learned in one tool is available everywhere.
+
+For a high-level overview of the project and its architecture, see the [README](README.md).
 
 ## What this deploys
 
-You are creating a Cloudflare Worker that exposes:
+You are creating a Cloudflare Worker that exposes three endpoints:
 
-- `POST /mcp` for MCP clients
-- `GET /health` for a quick health check
-- `GET /` for basic metadata
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/mcp` | `POST` | Main MCP protocol endpoint -- this is what AI clients connect to |
+| `/health` | `GET` | Health check returning D1 and Vectorize status |
+| `/` | `GET` | Basic service metadata |
 
-Storage is split across:
+The Worker uses three Cloudflare services for hybrid memory storage:
 
-- `D1` for the canonical memory records
-- `Vectorize` for semantic search
-- `Workers AI` for embeddings
+| Service | Binding | Role |
+|---------|---------|------|
+| D1 (SQLite) | `MEMORY_DB` | Canonical store for all memory records, tags, and metadata |
+| Vectorize | `MEMORY_INDEX` | Vector index for semantic similarity search (768-dim, cosine) |
+| Workers AI | `AI` | Generates embeddings with `@cf/baai/bge-base-en-v1.5` |
+
+Once deployed, any MCP client can `remember` facts, `recall` them by meaning or keyword, `forget` specific entries, and `list_namespaces` to see how memories are organized.
 
 ## Before you start
 
