@@ -1,9 +1,17 @@
 import { createMcpHandler } from 'agents/mcp';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
 const EMBEDDING_POOLING = 'cls';
+const MAX_NAMESPACE_LENGTH = 64;
+const MAX_CONTENT_LENGTH = 4_000;
+const MAX_SOURCE_LENGTH = 512;
+const MAX_QUERY_LENGTH = 512;
+const MAX_TAG_LENGTH = 64;
+const MAX_TAG_COUNT = 16;
+const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9:/_-]*$/;
 
 const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS memories (
@@ -34,6 +42,8 @@ type WorkerEnv = {
 	MEMORY_DB: D1Database;
 	AI: Ai;
 	MEMORY_INDEX: VectorizeIndex | Vectorize;
+	MCP_SHARED_TOKEN?: string;
+	ALLOW_UNAUTHENTICATED?: string;
 };
 
 let schemaReady: Promise<void> | undefined;
@@ -43,8 +53,90 @@ function normalizeNamespace(value?: string) {
 	return trimmed && trimmed.length > 0 ? trimmed : 'global';
 }
 
+function validateNamespace(value?: string) {
+	const normalized = normalizeNamespace(value);
+
+	if (normalized.length > MAX_NAMESPACE_LENGTH) {
+		throw new Error(`Namespace must be ${MAX_NAMESPACE_LENGTH} characters or fewer.`);
+	}
+
+	if (!NAMESPACE_PATTERN.test(normalized)) {
+		throw new Error('Namespace may only contain lowercase letters, numbers, colon, slash, underscore, and hyphen.');
+	}
+
+	return normalized;
+}
+
 function normalizeTags(tags?: string[]) {
-	return [...new Set((tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+	const normalized = [...new Set((tags ?? []).map((tag) => tag.trim().toLowerCase()).filter(Boolean))];
+
+	if (normalized.length > MAX_TAG_COUNT) {
+		throw new Error(`A maximum of ${MAX_TAG_COUNT} tags is allowed.`);
+	}
+
+	for (const tag of normalized) {
+		if (tag.length > MAX_TAG_LENGTH) {
+			throw new Error(`Each tag must be ${MAX_TAG_LENGTH} characters or fewer.`);
+		}
+	}
+
+	return normalized;
+}
+
+function normalizeTag(value?: string) {
+	return normalizeTags(value ? [value] : [])[0] ?? '';
+}
+
+function normalizeContent(value: string) {
+	const trimmed = value.trim();
+
+	if (trimmed.length === 0) {
+		throw new Error('Content cannot be empty.');
+	}
+
+	if (trimmed.length > MAX_CONTENT_LENGTH) {
+		throw new Error(`Content must be ${MAX_CONTENT_LENGTH} characters or fewer.`);
+	}
+
+	return trimmed;
+}
+
+function normalizeSource(value?: string) {
+	const trimmed = value?.trim();
+
+	if (!trimmed) {
+		return null;
+	}
+
+	if (trimmed.length > MAX_SOURCE_LENGTH) {
+		throw new Error(`Source must be ${MAX_SOURCE_LENGTH} characters or fewer.`);
+	}
+
+	return trimmed;
+}
+
+function normalizeQuery(value?: string) {
+	const trimmed = value?.trim().toLowerCase() ?? '';
+
+	if (trimmed.length > MAX_QUERY_LENGTH) {
+		throw new Error(`Query must be ${MAX_QUERY_LENGTH} characters or fewer.`);
+	}
+
+	return trimmed;
+}
+
+function normalizeId(value: string) {
+	const trimmed = value.trim();
+
+	if (trimmed.length === 0) {
+		throw new Error('ID cannot be empty.');
+	}
+
+	if (trimmed.length > 128) {
+		throw new Error('ID must be 128 characters or fewer.');
+	}
+
+	return trimmed;
 }
 
 function serializeMemory(row: MemoryRow) {
@@ -96,6 +188,86 @@ function getVectorizeHealthDetails(indexDetails: Awaited<ReturnType<VectorizeInd
 				: indexDetails.config.preset;
 
 	return { vectorCount, vectorDimensions };
+}
+
+function isTruthy(value?: string) {
+	return ['1', 'true', 'yes', 'on'].includes(value?.trim().toLowerCase() ?? '');
+}
+
+function constantTimeEqual(left: string, right: string) {
+	const leftBytes = Buffer.from(left);
+	const rightBytes = Buffer.from(right);
+
+	if (leftBytes.length !== rightBytes.length) {
+		return false;
+	}
+
+	return timingSafeEqual(leftBytes, rightBytes);
+}
+
+function authorizeRequest(request: Request, env: WorkerEnv) {
+	if (isTruthy(env.ALLOW_UNAUTHENTICATED)) {
+		return { ok: true as const };
+	}
+
+	const sharedToken = env.MCP_SHARED_TOKEN?.trim();
+
+	if (!sharedToken) {
+		return {
+			ok: false as const,
+			response: Response.json(
+				{
+					ok: false,
+					error: 'MCP_SHARED_TOKEN is not configured.',
+				},
+				{ status: 503 },
+			),
+		};
+	}
+
+	const authorization = request.headers.get('authorization');
+
+	if (!authorization?.startsWith('Bearer ')) {
+		return {
+			ok: false as const,
+			response: new Response(
+				JSON.stringify({
+					ok: false,
+					error: 'Unauthorized.',
+				}),
+				{
+					status: 401,
+					headers: {
+						'Content-Type': 'application/json',
+						'WWW-Authenticate': 'Bearer',
+					},
+				},
+			),
+		};
+	}
+
+	const token = authorization.slice(7).trim();
+
+	if (!constantTimeEqual(token, sharedToken)) {
+		return {
+			ok: false as const,
+			response: new Response(
+				JSON.stringify({
+					ok: false,
+					error: 'Unauthorized.',
+				}),
+				{
+					status: 401,
+					headers: {
+						'Content-Type': 'application/json',
+						'WWW-Authenticate': 'Bearer',
+					},
+				},
+			),
+		};
+	}
+
+	return { ok: true as const };
 }
 
 async function ensureSchema(db: D1Database) {
@@ -229,11 +401,11 @@ function createServer(env: WorkerEnv) {
 			await ensureSchema(env.MEMORY_DB);
 
 			const id = crypto.randomUUID();
-			const normalizedNamespace = normalizeNamespace(namespace);
+			const normalizedNamespace = validateNamespace(namespace);
 			const normalizedTags = normalizeTags(tags);
 			const normalizedTagString = normalizedTags.join(',');
-			const trimmedContent = content.trim();
-			const trimmedSource = source?.trim() || null;
+			const trimmedContent = normalizeContent(content);
+			const trimmedSource = normalizeSource(source);
 
 			await env.MEMORY_DB.prepare(
 				`INSERT INTO memories (id, namespace, content, tags, source)
@@ -294,15 +466,15 @@ function createServer(env: WorkerEnv) {
 			tag: z.string().optional(),
 			limit: z.number().int().min(1).max(25).optional(),
 		},
-		async ({ namespace, query, tag, limit }) => {
-			await ensureSchema(env.MEMORY_DB);
+			async ({ namespace, query, tag, limit }) => {
+				await ensureSchema(env.MEMORY_DB);
 
-			const normalizedNamespace = normalizeNamespace(namespace);
-			const normalizedQuery = query?.trim().toLowerCase() ?? '';
-			const normalizedTag = tag?.trim().toLowerCase() ?? '';
-			const safeLimit = limit ?? 10;
-			let results: MemoryRow[] = [];
-			let retrievalMode = 'recent';
+				const normalizedNamespace = validateNamespace(namespace);
+				const normalizedQuery = normalizeQuery(query);
+				const normalizedTag = normalizeTag(tag);
+				const safeLimit = limit ?? 10;
+				let results: MemoryRow[] = [];
+				let retrievalMode = 'recent';
 			let warnings: string[] = [];
 
 			if (normalizedQuery.length === 0) {
@@ -358,33 +530,40 @@ function createServer(env: WorkerEnv) {
 
 	server.tool(
 		'forget',
-		'Delete one memory by id.',
+		'Delete one memory by namespace and id.',
 		{
+			namespace: z.string().min(1),
 			id: z.string().min(1),
 		},
-		async ({ id }) => {
-			await ensureSchema(env.MEMORY_DB);
-			const result = await env.MEMORY_DB.prepare('DELETE FROM memories WHERE id = ?1').bind(id.trim()).run();
-			let vectorDeleted = false;
-			let warning: string | undefined;
+			async ({ id, namespace }) => {
+				await ensureSchema(env.MEMORY_DB);
+				const normalizedNamespace = validateNamespace(namespace);
+				const trimmedId = normalizeId(id);
+				const result = await env.MEMORY_DB.prepare('DELETE FROM memories WHERE namespace = ?1 AND id = ?2').bind(normalizedNamespace, trimmedId).run();
+				const deleted = result.meta.changes ?? 0;
+				let vectorDeleted = false;
+				let warning: string | undefined;
 
-			try {
-				await env.MEMORY_INDEX.deleteByIds([id.trim()]);
-				vectorDeleted = true;
-			} catch (error) {
-				warning = error instanceof Error ? error.message : String(error);
-			}
+				if (deleted > 0) {
+					try {
+						await env.MEMORY_INDEX.deleteByIds([trimmedId]);
+						vectorDeleted = true;
+					} catch (error) {
+						warning = error instanceof Error ? error.message : String(error);
+					}
+				}
 
-			return {
+				return {
 				content: [
 					{
 						type: 'text',
 						text: JSON.stringify(
-							{
-								ok: true,
-								deleted: result.meta.changes ?? 0,
-								id: id.trim(),
-								vectorDeleted,
+								{
+									ok: true,
+									deleted,
+									id: trimmedId,
+									namespace: normalizedNamespace,
+									vectorDeleted,
 								...(warning ? { warning } : {}),
 							},
 							null,
@@ -439,6 +618,13 @@ export default {
 		const url = new URL(request.url);
 
 		if (url.pathname === '/mcp') {
+			if (request.method !== 'OPTIONS') {
+				const auth = authorizeRequest(request, env);
+				if (!auth.ok) {
+					return auth.response;
+				}
+			}
+
 			const server = createServer(env);
 			return createMcpHandler(server)(request, env, ctx);
 		}
@@ -448,13 +634,12 @@ export default {
 				await ensureSchema(env.MEMORY_DB);
 				const row = await env.MEMORY_DB.prepare('SELECT COUNT(*) AS count FROM memories').first<{ count: number }>();
 				const vectorIndex = await env.MEMORY_INDEX.describe();
-				const { vectorCount, vectorDimensions } = getVectorizeHealthDetails(vectorIndex);
+				const { vectorDimensions } = getVectorizeHealthDetails(vectorIndex);
 				return Response.json({
 					ok: true,
-					memoryCount: Number(row?.count ?? 0),
-					vectorCount,
 					vectorDimensions,
 					embeddingModel: EMBEDDING_MODEL,
+					memoryStoreReady: Number(row?.count ?? 0) >= 0,
 				});
 			} catch (error) {
 				return Response.json(
@@ -471,8 +656,9 @@ export default {
 			return Response.json({
 				name: 'cloudflare-memory-mcp',
 				endpoint: '/mcp',
+				authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
 				tools: ['remember', 'recall', 'forget', 'list_namespaces'],
-				note: 'Shared memory is hybrid: D1 stores the canonical records and Vectorize handles semantic recall.',
+				note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall.',
 			});
 		}
 

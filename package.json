@@ -10,15 +10,18 @@
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.12.4",
+		"@cloudflare/vitest-pool-workers": "0.13.0",
 		"@types/node": "^25.5.0",
 		"typescript": "^5.5.2",
-		"vitest": "~3.2.0",
-		"wrangler": "^4.73.0"
+		"vitest": "4.1.0",
+		"wrangler": "4.73.0"
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.26.0",
 		"agents": "^0.7.6",
 		"zod": "^4.3.6"
+	},
+	"overrides": {
+		"undici": "7.24.3"
 	}
 }

@@ -26,7 +26,7 @@ That lets ChatGPT, Claude, Gemini, Zo, or any other MCP client share the same na
 
 - `remember`: save a memory in a namespace
 - `recall`: search or list memories in a namespace
-- `forget`: delete a memory by id
+- `forget`: delete a memory by namespace and id
 - `list_namespaces`: see what namespaces exist
 
 ## Setup
@@ -38,7 +38,9 @@ That lets ChatGPT, Claude, Gemini, Zo, or any other MCP client share the same na
    npx wrangler d1 create cloudflare-memory-mcp
    ```
 
-2. Copy the returned `database_id` into `wrangler.jsonc`.
+2. Keep `wrangler.jsonc` clean.
+
+   The checked-in config should keep the D1 binding by name only. Do not commit account-specific database IDs.
 
 3. Create the Vectorize index:
 
@@ -74,8 +76,8 @@ npx wrangler dev --remote
 ## Endpoints
 
 - `/` returns a small JSON description
-- `/health` checks D1 and the Vectorize binding
-- `/mcp` is the MCP endpoint
+- `/health` checks that D1 and the Vectorize binding are ready
+- `/mcp` is the MCP endpoint and now expects bearer auth by default
 
 ## CI/CD Deployment
 
@@ -111,7 +113,26 @@ https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
+## Authentication
+
+The MCP endpoint now fails closed by default.
+
+Set a Worker secret named `MCP_SHARED_TOKEN`, then connect clients with:
+
+```text
+Authorization: Bearer <your-token>
+```
+
+For local demos or deliberately public deployments, you can opt out by setting:
+
+```text
+ALLOW_UNAUTHENTICATED=true
+```
+
+That should be treated as a temporary development setting, not the normal production mode.
+
 ## Notes
 
 - `recall` blends semantic matches from Vectorize with keyword matches from D1.
-- The project is public and authless right now. For production, wrap `/mcp` with Cloudflare Access or another OAuth provider.
+- `forget` now deletes within a namespace, so callers must provide both `namespace` and `id`.
+- Input sizes are capped to reduce abuse and accidental AI/storage blowups.
