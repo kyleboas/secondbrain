@@ -101,6 +101,93 @@ async function listTools(customEnv: TestEnv) {
 }
 
 describe('cloudflare-memory-mcp worker', () => {
+	it('supports direct JSON remember and lookup endpoints for first-party adapters', async () => {
+		const sharedEnv = createMemoryTestEnv();
+
+		const rememberResponse = await fetchWithEnv(
+			'http://example.com/api/memory/remember',
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer top-secret',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					namespace: 'profile-api',
+					content: 'I prefer concise answers.',
+					source: 'blob:session:test',
+					tags: ['preference'],
+				}),
+			},
+			sharedEnv,
+		);
+
+		expect(rememberResponse.status).toBe(200);
+		await expect(rememberResponse.json()).resolves.toMatchObject({
+			ok: true,
+			namespace: 'profile-api',
+			tags: ['preference'],
+		});
+
+		const lookupResponse = await fetchWithEnv(
+			'http://example.com/api/memory/lookup',
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer top-secret',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					namespace: 'profile-api',
+					query: 'concise answers',
+				}),
+			},
+			sharedEnv,
+		);
+
+		expect(lookupResponse.status).toBe(200);
+		await expect(lookupResponse.json()).resolves.toMatchObject({
+			ok: true,
+			namespace: 'profile-api',
+			items: expect.arrayContaining([
+				expect.objectContaining({
+					content: 'I prefer concise answers.',
+				}),
+			]),
+		});
+	});
+
+	it('lists namespaces over the direct JSON API', async () => {
+		const sharedEnv = createMemoryTestEnv();
+		await internals.autoRemember(sharedEnv, {
+			text: 'I am working on secondbrain.',
+			namespace: 'projects',
+			source: 'chat:test',
+			maxItems: 2,
+		});
+
+		const response = await fetchWithEnv(
+			'http://example.com/api/memory/namespaces',
+			{
+				method: 'GET',
+				headers: {
+					Authorization: 'Bearer top-secret',
+				},
+			},
+			sharedEnv,
+		);
+
+		expect(response.status).toBe(200);
+		await expect(response.json()).resolves.toMatchObject({
+			ok: true,
+			items: expect.arrayContaining([
+				expect.objectContaining({
+					namespace: 'projects',
+				}),
+			]),
+		});
+	});
+
 	it('requires bearer auth for /mcp when a shared token is configured', async () => {
 		const request = new Request<unknown, IncomingRequestCfProperties>('http://example.com/mcp', {
 			method: 'POST',
@@ -386,6 +473,27 @@ describe('cloudflare-memory-mcp worker', () => {
 	});
 
 	describe('/retrieve endpoint', () => {
+		it('supports the stable direct adapter route', async () => {
+			const testEnv = createMemoryTestEnv();
+			const response = await fetchWithEnv(
+				'http://example.com/api/memory/retrieve',
+				{
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${testEnv.MCP_SHARED_TOKEN}`,
+					},
+					body: JSON.stringify({ message: 'What are my coding preferences?' }),
+				},
+				testEnv,
+			);
+			expect(response.status).toBe(200);
+			const body = await response.json() as { ok: boolean; skipped: boolean; memories: unknown[] };
+			expect(body.ok).toBe(true);
+			expect(body.skipped).toBe(false);
+			expect(Array.isArray(body.memories)).toBe(true);
+		});
+
 		it('requires authentication', async () => {
 			const response = await fetchWithEnv(
 				'http://example.com/retrieve',

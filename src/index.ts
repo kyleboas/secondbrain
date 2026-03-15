@@ -24,6 +24,33 @@ const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9:/_-]*$/;
 const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+const LOOKUP_API_SCHEMA = z.object({
+	namespace: z.string().optional(),
+	query: z.string().min(1),
+	limit: z.number().int().min(1).max(12).optional(),
+});
+
+const REMEMBER_API_SCHEMA = z.object({
+	namespace: z.string().optional(),
+	content: z.string().min(1),
+	tags: z.array(z.string()).optional(),
+	source: z.string().optional(),
+});
+
+const AUTO_REMEMBER_API_SCHEMA = z.object({
+	namespace: z.string().optional(),
+	text: z.string().min(1),
+	tags: z.array(z.string()).optional(),
+	source: z.string().optional(),
+	maxItems: z.number().int().min(1).max(MAX_AUTO_REMEMBER_ITEMS).optional(),
+	dryRun: z.boolean().optional(),
+});
+
+const FORGET_API_SCHEMA = z.object({
+	namespace: z.string().min(1),
+	id: z.string().min(1),
+});
+
 const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS memories (
 		id TEXT PRIMARY KEY,
@@ -1130,9 +1157,80 @@ async function recallMemories(
 	};
 }
 
+async function forgetMemory(
+	env: WorkerEnv,
+	input: {
+		namespace: string;
+		id: string;
+	},
+) {
+	await ensureSchema(env.MEMORY_DB);
+	const normalizedNamespace = validateNamespace(input.namespace);
+	const trimmedId = normalizeId(input.id);
+	const result = await env.MEMORY_DB.prepare('DELETE FROM memories WHERE namespace = ?1 AND id = ?2').bind(normalizedNamespace, trimmedId).run();
+	const deleted = result.meta.changes ?? 0;
+	let vectorDeleted = false;
+	let warning: string | undefined;
+
+	if (deleted > 0) {
+		try {
+			await env.MEMORY_INDEX.deleteByIds([trimmedId]);
+			vectorDeleted = true;
+		} catch (error) {
+			warning = error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	return {
+		ok: true,
+		deleted,
+		id: trimmedId,
+		namespace: normalizedNamespace,
+		vectorDeleted,
+		...(warning ? { warning } : {}),
+	};
+}
+
 function isTrivialMessage(message: string) {
 	const trimmed = message.trim();
 	return trimmed.length <= TRIVIAL_MAX_LENGTH && TRIVIAL_PATTERNS.test(trimmed);
+}
+
+async function listNamespaces(env: WorkerEnv) {
+	await ensureSchema(env.MEMORY_DB);
+	const { results } = await env.MEMORY_DB.prepare(
+		`SELECT namespace, COUNT(*) AS count, MAX(created_at) AS last_created_at
+		 FROM memories
+		 GROUP BY namespace
+		 ORDER BY count DESC, namespace ASC`,
+	).all<{ namespace: string; count: number; last_created_at: string | null }>();
+
+	return {
+		ok: true,
+		items: results.map((row: { namespace: string; count: number; last_created_at: string | null }) => ({
+			namespace: row.namespace,
+			count: Number(row.count),
+			lastCreatedAt: row.last_created_at,
+		})),
+	};
+}
+
+async function readJsonBody(request: Request) {
+	try {
+		return await request.json();
+	} catch {
+		throw new Error('Invalid JSON body.');
+	}
+}
+
+function jsonWithCors(data: unknown, init?: ResponseInit) {
+	return Response.json(data, {
+		...init,
+		headers: {
+			...corsHeaders(),
+			...(init?.headers ?? {}),
+		},
+	});
 }
 
 async function handleRetrieve(request: Request, env: WorkerEnv): Promise<Response> {
@@ -1394,40 +1492,13 @@ function createServer(env: WorkerEnv) {
 			namespace: z.string().min(1),
 			id: z.string().min(1),
 		},
-			async ({ id, namespace }) => {
-				await ensureSchema(env.MEMORY_DB);
-				const normalizedNamespace = validateNamespace(namespace);
-				const trimmedId = normalizeId(id);
-				const result = await env.MEMORY_DB.prepare('DELETE FROM memories WHERE namespace = ?1 AND id = ?2').bind(normalizedNamespace, trimmedId).run();
-				const deleted = result.meta.changes ?? 0;
-				let vectorDeleted = false;
-				let warning: string | undefined;
-
-				if (deleted > 0) {
-					try {
-						await env.MEMORY_INDEX.deleteByIds([trimmedId]);
-						vectorDeleted = true;
-					} catch (error) {
-						warning = error instanceof Error ? error.message : String(error);
-					}
-				}
-
-				return {
+		async ({ id, namespace }) => {
+			const result = await forgetMemory(env, { id, namespace });
+			return {
 				content: [
 					{
 						type: 'text',
-						text: JSON.stringify(
-								{
-									ok: true,
-									deleted,
-									id: trimmedId,
-									namespace: normalizedNamespace,
-									vectorDeleted,
-								...(warning ? { warning } : {}),
-							},
-							null,
-							2,
-						),
+						text: JSON.stringify(result, null, 2),
 					},
 				],
 			};
@@ -1439,30 +1510,12 @@ function createServer(env: WorkerEnv) {
 		'List the namespaces currently holding memories.',
 		{},
 		async () => {
-			await ensureSchema(env.MEMORY_DB);
-			const { results } = await env.MEMORY_DB.prepare(
-				`SELECT namespace, COUNT(*) AS count, MAX(created_at) AS last_created_at
-				 FROM memories
-				 GROUP BY namespace
-				 ORDER BY count DESC, namespace ASC`,
-			).all<{ namespace: string; count: number; last_created_at: string | null }>();
-
+			const result = await listNamespaces(env);
 			return {
 				content: [
 					{
 						type: 'text',
-						text: JSON.stringify(
-							{
-								ok: true,
-								items: results.map((row: { namespace: string; count: number; last_created_at: string | null }) => ({
-									namespace: row.namespace,
-									count: Number(row.count),
-									lastCreatedAt: row.last_created_at,
-								})),
-							},
-							null,
-							2,
-						),
+						text: JSON.stringify(result, null, 2),
 					},
 				],
 			};
@@ -1580,8 +1633,8 @@ export default {
 
 		// Handle CORS preflight for OAuth endpoints
 		if (request.method === 'OPTIONS') {
-			const oauthPaths = ['/.well-known/oauth-authorization-server', '/oauth/register', '/oauth/token'];
-			if (oauthPaths.includes(url.pathname)) {
+			const corsPaths = ['/.well-known/oauth-authorization-server', '/oauth/register', '/oauth/token'];
+			if (corsPaths.includes(url.pathname) || url.pathname.startsWith('/api/memory/') || url.pathname === '/retrieve') {
 				return new Response(null, { status: 204, headers: corsHeaders() });
 			}
 		}
@@ -1617,6 +1670,67 @@ export default {
 
 		if (url.pathname === '/oauth/token' && request.method === 'POST') {
 			return handleOAuthToken(request, env);
+		}
+
+		if (url.pathname.startsWith('/api/memory/')) {
+			const auth = await authorizeRequest(request, env);
+			if (!auth.ok) {
+				return auth.response;
+			}
+
+			try {
+				if (url.pathname === '/api/memory/lookup' && request.method === 'POST') {
+					const body = LOOKUP_API_SCHEMA.parse(await readJsonBody(request));
+					return jsonWithCors(await recallMemories(env, body));
+				}
+
+				if (url.pathname === '/api/memory/remember' && request.method === 'POST') {
+					const body = REMEMBER_API_SCHEMA.parse(await readJsonBody(request));
+					return jsonWithCors(await storeMemory(env, body));
+				}
+
+				if (url.pathname === '/api/memory/auto-remember' && request.method === 'POST') {
+					const body = AUTO_REMEMBER_API_SCHEMA.parse(await readJsonBody(request));
+					return jsonWithCors(await autoRemember(env, body));
+				}
+
+				if (url.pathname === '/api/memory/forget' && request.method === 'POST') {
+					const body = FORGET_API_SCHEMA.parse(await readJsonBody(request));
+					return jsonWithCors(await forgetMemory(env, body));
+				}
+
+				if (url.pathname === '/api/memory/namespaces' && request.method === 'GET') {
+					return jsonWithCors(await listNamespaces(env));
+				}
+
+				if (url.pathname === '/api/memory/retrieve') {
+					return handleRetrieve(request, env);
+				}
+
+				return jsonWithCors({ ok: false, error: 'Not Found' }, { status: 404 });
+			} catch (error) {
+				if (error instanceof z.ZodError) {
+					return jsonWithCors(
+						{
+							ok: false,
+							error: 'Invalid request body.',
+							details: error.issues.map((issue) => ({
+								path: issue.path.join('.'),
+								message: issue.message,
+							})),
+						},
+						{ status: 400 },
+					);
+				}
+
+				return jsonWithCors(
+					{
+						ok: false,
+						error: error instanceof Error ? error.message : String(error),
+					},
+					{ status: 400 },
+				);
+			}
 		}
 
 		if (url.pathname === '/retrieve') {
@@ -1662,10 +1776,12 @@ export default {
 				return Response.json({
 					name: 'cloudflare-memory-mcp',
 					endpoint: '/mcp',
-					retrieveEndpoint: '/retrieve',
+					apiBase: '/api/memory',
+					retrieveEndpoint: '/api/memory/retrieve',
+					legacyRetrieveEndpoint: '/retrieve',
 					authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
 					tools: ['lookup_memory', 'auto_remember', 'remember', 'recall', 'forget', 'list_namespaces'],
-					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. POST /retrieve for automatic pre-generation memory retrieval. lookup_memory is the preferred MCP read tool, and auto_remember is the preferred MCP write tool for raw conversation text.',
+					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. Use /api/memory/* for first-party adapters like blob, especially /api/memory/retrieve for automatic pre-generation memory retrieval. /retrieve remains as a compatibility alias. lookup_memory is the preferred MCP read tool, and auto_remember is the preferred MCP write tool for raw conversation text.',
 				});
 			}
 

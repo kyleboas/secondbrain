@@ -48,6 +48,7 @@ The server exposes six MCP tools:
 License: MIT. See `LICENSE`.
 
 For a step-by-step self-setup guide, see `SETUP.md`.
+For the multi-client architecture and the recommended `blob` integration path, see `ARCHITECTURE.md`.
 
 ## Quick Deploy
 
@@ -116,6 +117,8 @@ npx wrangler dev --remote
 - `/` returns a small JSON description
 - `/health` checks that D1 and the Vectorize binding are ready
 - `/mcp` is the MCP endpoint and now expects bearer auth by default
+- `/api/memory/*` is the direct JSON API for first-party adapters like `blob`
+- `/retrieve` is a compatibility alias for wrapper-style automatic memory retrieval
 
 ## CI/CD Deployment
 
@@ -153,6 +156,8 @@ Paste that URL into Claude (`Settings → Connectors`) or ChatGPT (custom connec
 
 For scripts and local proxies that set headers directly, the raw `MCP_SHARED_TOKEN` value still works as a bearer token.
 
+For first-party adapters you control, like `blob`, use the direct JSON API under `/api/memory/*` instead of MCP tool calls.
+
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
 ## Authentication
@@ -181,6 +186,7 @@ That should be treated as a temporary development setting, not normal production
 ## Notes
 
 - `lookup_memory` is the preferred read path for normal chat turns where the model should check saved context before answering.
+- `/api/memory/retrieve` is the preferred direct pre-generation retrieval path for wrapper apps like `blob`; `/retrieve` remains as a compatibility alias.
 - `recall` blends semantic matches from Vectorize with keyword matches from D1, but it is now positioned as the lower-level direct search fallback.
 - `forget` now deletes within a namespace, so callers must provide both `namespace` and `id`.
 - `auto_remember` is explicit, not ambient: a client has to call it with conversation text before anything is stored automatically, but it is now described as the preferred write path for chat transcripts so clients have a stronger default cue.

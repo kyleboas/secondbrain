@@ -224,6 +224,19 @@ Authorization: Bearer <your-MCP_SHARED_TOKEN>
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
+For first-party clients you control, like `blob`, prefer the direct JSON API instead:
+
+| Endpoint | Method |
+|---|---|
+| `/api/memory/lookup` | `POST` |
+| `/api/memory/retrieve` | `POST` |
+| `/api/memory/remember` | `POST` |
+| `/api/memory/auto-remember` | `POST` |
+| `/api/memory/forget` | `POST` |
+| `/api/memory/namespaces` | `GET` |
+
+See `ARCHITECTURE.md` for the client-by-client integration plan.
+
 ### 9.4. Using `lookup_memory`
 
 `lookup_memory` is the tool to use when a client should check saved context before answering a user request.
@@ -235,7 +248,18 @@ Important:
 - it returns semantically relevant memories plus keyword matches from the same namespace
 - clients should use only clearly relevant matches and ignore unrelated ones
 
-### 9.5. Using `auto_remember`
+### 9.5. Using `/api/memory/retrieve`
+
+`/api/memory/retrieve` is the direct API endpoint to use when a wrapper app like `blob` should fetch memory before model generation.
+
+Important:
+
+- send `{ "message": "<latest user message>" }` in the body
+- use `namespace` to keep memory segmented per user or project
+- inject the returned `context` only when it is non-null
+- `/retrieve` still works, but `/api/memory/retrieve` is the stable route for first-party adapters
+
+### 9.6. Using `auto_remember`
 
 `auto_remember` is the tool to use when you want a client to save likely durable memories from a block of conversation text.
 
