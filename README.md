@@ -1,3 +1,5 @@
+![](./assets/logo.png)
+
 # secondbrain
 
 License: MIT. See `LICENSE`.
@@ -138,32 +140,3 @@ That should be treated as a temporary development setting, not the normal produc
 - `recall` blends semantic matches from Vectorize with keyword matches from D1.
 - `forget` now deletes within a namespace, so callers must provide both `namespace` and `id`.
 - Input sizes are capped to reduce abuse and accidental AI/storage blowups.
-
-## Adding a logo
-
-The cleanest repo-level setup is:
-
-1. Put your image in `assets/`, for example:
-
-   ```text
-   assets/logo.png
-   ```
-
-2. Add it near the top of this README:
-
-   ```md
-   ![secondbrain logo](./assets/logo.png)
-   ```
-
-3. If you want the GitHub repo itself to show branded sharing cards, upload a wider social preview image in:
-
-   ```text
-   GitHub -> Settings -> General -> Social preview
-   ```
-
-Practical guidance:
-
-- use `logo.svg` if you want a crisp transparent logo
-- use `logo.png` if you want the simplest GitHub-friendly image
-- keep the README logo reasonably small so it does not dominate the page
-- use a separate wide image for GitHub social preview; that is not the same thing as the inline README logo
