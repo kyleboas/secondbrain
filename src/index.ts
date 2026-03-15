@@ -1074,14 +1074,56 @@ function createServer(env: WorkerEnv) {
 		version: '0.1.0',
 	});
 
-	server.tool(
-		'remember',
-		'Store a shared memory that other MCP clients can retrieve later.',
+	server.registerTool(
+		'auto_remember',
 		{
-			namespace: z.string().optional(),
-			content: z.string().min(1),
-			tags: z.array(z.string()).optional(),
-			source: z.string().optional(),
+			title: 'Capture durable memory from conversation',
+			description:
+				'Preferred memory-writing tool for chat clients. Use this when the user shares durable preferences, identity details, goals, constraints, or ongoing project facts in raw conversation text. Pass the relevant excerpt in text. Set dryRun=true to preview before saving.',
+			inputSchema: {
+				namespace: z.string().optional(),
+				text: z.string().min(1),
+				tags: z.array(z.string()).optional(),
+				source: z.string().optional(),
+				maxItems: z.number().int().min(1).max(MAX_AUTO_REMEMBER_ITEMS).optional(),
+				dryRun: z.boolean().optional(),
+			},
+			annotations: {
+				title: 'Preferred conversation memory capture',
+			},
+		},
+		async ({ namespace, text, tags, source, maxItems, dryRun }) => {
+			const result = await autoRemember(env, { namespace, text, tags, source, maxItems, dryRun });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: JSON.stringify(
+							result,
+							null,
+							2,
+						),
+					},
+				],
+			};
+		},
+	);
+
+	server.registerTool(
+		'remember',
+		{
+			title: 'Save one explicit memory',
+			description:
+				'Use this when you already have a single memory distilled to one clear fact. For raw chat transcripts or when multiple durable facts may be present, prefer auto_remember instead.',
+			inputSchema: {
+				namespace: z.string().optional(),
+				content: z.string().min(1),
+				tags: z.array(z.string()).optional(),
+				source: z.string().optional(),
+			},
+			annotations: {
+				title: 'Single memory write',
+			},
 		},
 		async ({ namespace, content, tags, source }) => {
 			const stored = await storeMemory(env, { namespace, content, tags, source });
@@ -1092,34 +1134,6 @@ function createServer(env: WorkerEnv) {
 						type: 'text',
 						text: JSON.stringify(
 							stored,
-							null,
-							2,
-						),
-					},
-				],
-			};
-		},
-		);
-
-	server.tool(
-		'auto_remember',
-		'Extract likely durable memories from raw conversation text, then preview or store them conservatively.',
-		{
-			namespace: z.string().optional(),
-			text: z.string().min(1),
-			tags: z.array(z.string()).optional(),
-			source: z.string().optional(),
-			maxItems: z.number().int().min(1).max(MAX_AUTO_REMEMBER_ITEMS).optional(),
-			dryRun: z.boolean().optional(),
-		},
-		async ({ namespace, text, tags, source, maxItems, dryRun }) => {
-			const result = await autoRemember(env, { namespace, text, tags, source, maxItems, dryRun });
-			return {
-				content: [
-					{
-						type: 'text',
-						text: JSON.stringify(
-							result,
 							null,
 							2,
 						),
@@ -1471,8 +1485,8 @@ export default {
 					name: 'cloudflare-memory-mcp',
 					endpoint: '/mcp',
 					authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
-					tools: ['remember', 'auto_remember', 'recall', 'forget', 'list_namespaces'],
-					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall.',
+					tools: ['auto_remember', 'remember', 'recall', 'forget', 'list_namespaces'],
+					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall. auto_remember is the preferred write tool for raw conversation text.',
 				});
 			}
 

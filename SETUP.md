@@ -226,6 +226,7 @@ If a client does not support remote MCP directly, use a local proxy such as `mcp
 
 Important:
 
+- the server now advertises `auto_remember` as the preferred conversation-writing tool, while `remember` is described as the single-fact fallback
 - it is explicit, not ambient — nothing is stored unless the client calls `auto_remember`
 - it works best on plain conversation transcripts, summaries, or meeting notes
 - it uses conservative heuristics and skips exact duplicate memory content inside the same namespace
