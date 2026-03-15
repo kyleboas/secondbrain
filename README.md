@@ -81,21 +81,20 @@ The repository includes a GitHub Action that auto-deploys on push to `main`. To 
 
 1. Get your Cloudflare **Account ID** from the Cloudflare dashboard sidebar.
 
-2. Create or find your D1 database, then copy its **database ID**.
-
-3. Create a Cloudflare **API Token** for the target account with these permissions:
+2. Create a Cloudflare **API Token** for the target account with these permissions:
    - `Workers Scripts:Edit`
    - `D1:Edit`
    - `Vectorize:Edit`
    - `Account:Read`
 
-4. Add these to your GitHub repo:
+3. Add these to your GitHub repo:
    - `CLOUDFLARE_API_TOKEN` as a repository secret
    - `CLOUDFLARE_ACCOUNT_ID` as either a repository secret or variable
-   - `CLOUDFLARE_D1_DATABASE_ID` as either a repository secret or variable
 
 The workflow will:
 - Validate that the required Cloudflare settings are present
+- Create or reuse the D1 database named `cloudflare-memory-mcp`
+- Create or reuse the Vectorize index named `cloudflare-memory-index`
 - Patch `wrangler.jsonc` at runtime with the real D1 database ID
 - Apply D1 migrations automatically
 - Deploy the Worker on every push to `main`
