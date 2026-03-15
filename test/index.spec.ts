@@ -61,9 +61,31 @@ describe('cloudflare-memory-mcp worker', () => {
 		await waitOnExecutionContext(ctx);
 
 		expect(response.status).toBe(401);
+		expect(response.headers.get('WWW-Authenticate')).toContain('/.well-known/oauth-protected-resource');
 		await expect(response.json()).resolves.toMatchObject({
 			ok: false,
 			error: 'Unauthorized.',
+		});
+	});
+
+	it('serves OAuth protected-resource metadata for MCP discovery', async () => {
+		const response = await fetchWithEnv('http://example.com/.well-known/oauth-protected-resource');
+
+		expect(response.status).toBe(200);
+		await expect(response.json()).resolves.toMatchObject({
+			resource: 'http://example.com/mcp',
+			authorization_servers: ['http://example.com'],
+			bearer_methods_supported: ['header'],
+		});
+	});
+
+	it('serves path-specific OAuth protected-resource metadata for MCP discovery', async () => {
+		const response = await fetchWithEnv('http://example.com/.well-known/oauth-protected-resource/mcp');
+
+		expect(response.status).toBe(200);
+		await expect(response.json()).resolves.toMatchObject({
+			resource: 'http://example.com/mcp',
+			authorization_servers: ['http://example.com'],
 		});
 	});
 
