@@ -1,11 +1,29 @@
 import { createExecutionContext, env, waitOnExecutionContext, SELF } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
-import worker from '../src';
+import worker, { internals } from '../src';
 
 type TestEnv = typeof env & {
 	MCP_SHARED_TOKEN?: string;
 	ALLOW_UNAUTHENTICATED?: string;
 };
+
+function createMemoryTestEnv() {
+	return {
+		...env,
+		MCP_SHARED_TOKEN: 'top-secret',
+		AI: {
+			run: async () => ({
+				data: [[0.1, 0.2, 0.3]],
+			}),
+		},
+		MEMORY_INDEX: {
+			upsert: async () => undefined,
+			deleteByIds: async () => undefined,
+			query: async () => ({ matches: [] }),
+			describe: async () => ({ dimensions: 3, vectorsCount: 0 }),
+		},
+	} as TestEnv;
+}
 
 async function sha256Base64Url(value: string) {
 	const data = new TextEncoder().encode(value);
@@ -69,6 +87,84 @@ describe('cloudflare-memory-mcp worker', () => {
 		await expect(response.json()).resolves.toMatchObject({
 			error: 'invalid_request',
 		});
+	});
+
+	it('advertises auto_remember in service metadata', async () => {
+		const response = await fetchWithEnv('http://example.com/');
+		await expect(response.json()).resolves.toMatchObject({
+			tools: expect.arrayContaining(['auto_remember']),
+		});
+	});
+
+	it('auto_remember previews likely memories without storing them in dry-run mode', async () => {
+		const sharedEnv = createMemoryTestEnv();
+		const result = await internals.autoRemember(sharedEnv, {
+			text: `Call me Kyle.\nI prefer concise answers.\nThanks!`,
+			dryRun: true,
+			maxItems: 3,
+		});
+
+		expect(result).toMatchObject({
+			ok: true,
+			dryRun: true,
+			count: 2,
+		});
+		expect(result.items).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					content: 'Call me Kyle.',
+				}),
+				expect.objectContaining({
+					content: 'I prefer concise answers.',
+				}),
+			]),
+		);
+	});
+
+	it('auto_remember stores extracted memories and skips exact duplicates', async () => {
+		const sharedEnv = createMemoryTestEnv();
+		const conversation = `Call me Kyle.\nI prefer concise answers.\nI am working on secondbrain.\nOkay.`;
+
+		const firstRun = await internals.autoRemember(sharedEnv, {
+			text: conversation,
+			namespace: 'profile',
+			source: 'chat:test',
+			maxItems: 4,
+		});
+
+		expect(firstRun).toMatchObject({
+			ok: true,
+			namespace: 'profile',
+			savedCount: 3,
+			skippedCount: 0,
+		});
+
+		const secondRun = await internals.autoRemember(sharedEnv, {
+			text: conversation,
+			namespace: 'profile',
+			source: 'chat:test',
+			maxItems: 4,
+		});
+
+		expect(secondRun).toMatchObject({
+			ok: true,
+			namespace: 'profile',
+			savedCount: 0,
+			skippedCount: 3,
+		});
+
+		const storedRows = await sharedEnv.MEMORY_DB
+			.prepare('SELECT namespace, content FROM memories WHERE namespace = ?1 ORDER BY content ASC')
+			.bind('profile')
+			.all<{ namespace: string; content: string }>();
+
+		expect(storedRows.results).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ namespace: 'profile', content: 'Call me Kyle.' }),
+				expect.objectContaining({ namespace: 'profile', content: 'I prefer concise answers.' }),
+				expect.objectContaining({ namespace: 'profile', content: 'I am working on secondbrain.' }),
+			]),
+		);
 	});
 
 	it('uses the validated authorize request values and invalidates oauth tokens after password rotation', async () => {
