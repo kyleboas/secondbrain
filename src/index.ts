@@ -11,8 +11,12 @@ const MAX_SOURCE_LENGTH = 512;
 const MAX_QUERY_LENGTH = 512;
 const MAX_TAG_LENGTH = 64;
 const MAX_TAG_COUNT = 16;
+const MAX_REDIRECT_URI_LENGTH = 2_048;
+const MAX_REDIRECT_URI_COUNT = 10;
+const MAX_CLIENT_NAME_LENGTH = 128;
 const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9:/_-]*$/;
 const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS memories (
@@ -47,6 +51,8 @@ const OAUTH_SCHEMA_STATEMENTS = [
 	`CREATE TABLE IF NOT EXISTS oauth_tokens (
 		token TEXT PRIMARY KEY,
 		client_id TEXT NOT NULL,
+		secret_fingerprint TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	)`,
 ];
@@ -74,6 +80,13 @@ type OAuthCodeRow = {
 	code_challenge: string | null;
 	code_challenge_method: string | null;
 	expires_at: string;
+};
+
+type OAuthTokenRow = {
+	token: string;
+	client_id: string;
+	expires_at: string | null;
+	secret_fingerprint: string | null;
 };
 
 type WorkerEnv = {
@@ -263,6 +276,109 @@ async function verifyPkceChallenge(verifier: string, challenge: string): Promise
 	return base64url === challenge;
 }
 
+function base64UrlEncode(bytes: Uint8Array) {
+	return btoa(String.fromCharCode(...bytes))
+		.replace(/\+/g, '-')
+		.replace(/\//g, '_')
+		.replace(/=/g, '');
+}
+
+async function sha256Base64Url(value: string) {
+	const data = new TextEncoder().encode(value);
+	const digest = await crypto.subtle.digest('SHA-256', data);
+	return base64UrlEncode(new Uint8Array(digest));
+}
+
+function isLoopbackHostname(hostname: string) {
+	return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+}
+
+function validateRedirectUri(value: string) {
+	const trimmed = value.trim();
+
+	if (trimmed.length === 0) {
+		throw new Error('redirect_uri cannot be empty.');
+	}
+
+	if (trimmed.length > MAX_REDIRECT_URI_LENGTH) {
+		throw new Error(`redirect_uri must be ${MAX_REDIRECT_URI_LENGTH} characters or fewer.`);
+	}
+
+	let url: URL;
+	try {
+		url = new URL(trimmed);
+	} catch {
+		throw new Error('redirect_uri must be a valid absolute URL.');
+	}
+
+	if (url.hash) {
+		throw new Error('redirect_uri must not include a fragment.');
+	}
+
+	if (url.username || url.password) {
+		throw new Error('redirect_uri must not include userinfo.');
+	}
+
+	if (url.protocol === 'https:') {
+		return url.toString();
+	}
+
+	if (url.protocol === 'http:' && isLoopbackHostname(url.hostname)) {
+		return url.toString();
+	}
+
+	throw new Error('redirect_uri must use https or loopback http.');
+}
+
+function parseRedirectUris(value: string) {
+	try {
+		const parsed = JSON.parse(value) as unknown;
+
+		if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === 'string')) {
+			throw new Error('Stored redirect URIs are invalid.');
+		}
+
+		return parsed.map((uri) => validateRedirectUri(uri));
+	} catch {
+		const fallback = value.split(' ').filter(Boolean);
+
+		if (fallback.length === 0) {
+			throw new Error('Stored redirect URIs are invalid.');
+		}
+
+		return fallback.map((uri) => validateRedirectUri(uri));
+	}
+}
+
+function normalizeRedirectUris(value: unknown) {
+	if (!Array.isArray(value) || value.length === 0 || !value.every((item) => typeof item === 'string')) {
+		throw new Error('redirect_uris must be a non-empty array of strings.');
+	}
+
+	if (value.length > MAX_REDIRECT_URI_COUNT) {
+		throw new Error(`A maximum of ${MAX_REDIRECT_URI_COUNT} redirect URIs is allowed.`);
+	}
+
+	return [...new Set(value.map((uri) => validateRedirectUri(uri)))];
+}
+
+function normalizeClientName(value: unknown) {
+	if (typeof value !== 'string') {
+		return null;
+	}
+
+	const trimmed = value.trim();
+	if (!trimmed) {
+		return null;
+	}
+
+	if (trimmed.length > MAX_CLIENT_NAME_LENGTH) {
+		throw new Error(`client_name must be ${MAX_CLIENT_NAME_LENGTH} characters or fewer.`);
+	}
+
+	return trimmed;
+}
+
 function htmlEscape(str: string): string {
 	return str
 		.replace(/&/g, '&amp;')
@@ -327,14 +443,21 @@ async function authorizeRequest(request: Request, env: WorkerEnv) {
 	}
 
 	// Check OAuth access tokens in D1
-	if (token) {
+	if (token && sharedToken) {
 		await ensureOAuthSchema(env.MEMORY_DB);
+		const secretFingerprint = await sha256Base64Url(sharedToken);
 		const row = await env.MEMORY_DB
-			.prepare('SELECT token FROM oauth_tokens WHERE token = ?1')
+			.prepare('SELECT token, client_id, expires_at, secret_fingerprint FROM oauth_tokens WHERE token = ?1')
 			.bind(token)
-			.first<{ token: string }>();
+			.first<OAuthTokenRow>();
 		if (row) {
-			return { ok: true as const };
+			if (!row.expires_at || !row.secret_fingerprint) {
+				await env.MEMORY_DB.prepare('DELETE FROM oauth_tokens WHERE token = ?1').bind(token).run();
+			} else if (new Date(row.expires_at) < new Date()) {
+				await env.MEMORY_DB.prepare('DELETE FROM oauth_tokens WHERE token = ?1').bind(token).run();
+			} else if (constantTimeEqual(row.secret_fingerprint, secretFingerprint)) {
+				return { ok: true as const };
+			}
 		}
 	}
 
@@ -357,24 +480,16 @@ async function authorizeRequest(request: Request, env: WorkerEnv) {
 				status: 401,
 				headers: {
 					'Content-Type': 'application/json',
-					'WWW-Authenticate': 'Bearer resource_metadata="/.well-known/oauth-authorization-server"',
+					'WWW-Authenticate': `Bearer realm="secondbrain", resource_metadata="${new URL('/.well-known/oauth-authorization-server', request.url).toString()}"`,
 				},
 			},
 		),
 	};
 }
 
-function renderAuthPage(
-	clientName: string,
-	clientId: string,
-	redirectUri: string,
-	state: string,
-	codeChallenge: string,
-	codeChallengeMethod: string,
-	error: string | null,
-): Response {
+function renderAuthPage(clientName: string, error: string | null): Response {
 	const html = `<!DOCTYPE html>
-<html lang="en">
+	<html lang="en">
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
@@ -396,18 +511,13 @@ function renderAuthPage(
 </head>
 <body>
 	<div class="card">
-		<h1>secondbrain</h1>
-		<p class="subtitle">Authorizing <strong>${htmlEscape(clientName)}</strong> to access your memories.</p>
-		${error ? `<div class="error">${htmlEscape(error)}</div>` : ''}
-		<form method="POST">
-			<input type="hidden" name="client_id" value="${htmlEscape(clientId)}">
-			<input type="hidden" name="redirect_uri" value="${htmlEscape(redirectUri)}">
-			<input type="hidden" name="state" value="${htmlEscape(state)}">
-			<input type="hidden" name="code_challenge" value="${htmlEscape(codeChallenge)}">
-			<input type="hidden" name="code_challenge_method" value="${htmlEscape(codeChallengeMethod)}">
-			<label for="password">Admin password</label>
-			<input type="password" id="password" name="password" autocomplete="current-password" autofocus required>
-			<button type="submit">Authorize access</button>
+			<h1>secondbrain</h1>
+			<p class="subtitle">Authorizing <strong>${htmlEscape(clientName)}</strong> to access your memories.</p>
+			${error ? `<div class="error">${htmlEscape(error)}</div>` : ''}
+			<form method="POST">
+				<label for="password">Admin password</label>
+				<input type="password" id="password" name="password" autocomplete="current-password" autofocus required>
+				<button type="submit">Authorize access</button>
 		</form>
 	</div>
 </body>
@@ -429,23 +539,26 @@ async function handleOAuthRegister(request: Request, env: WorkerEnv): Promise<Re
 		return Response.json(
 			{ error: 'invalid_request', error_description: 'Invalid JSON body.' },
 			{ status: 400, headers: corsHeaders() },
-		);
+			);
 	}
 
-	const redirectUris = body['redirect_uris'];
-	if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every((u) => typeof u === 'string')) {
+	let redirectUris: string[];
+	let name: string | null;
+	try {
+		redirectUris = normalizeRedirectUris(body['redirect_uris']);
+		name = normalizeClientName(body['client_name']);
+	} catch (error) {
 		return Response.json(
-			{ error: 'invalid_request', error_description: 'redirect_uris must be a non-empty array of strings.' },
+			{ error: 'invalid_request', error_description: error instanceof Error ? error.message : String(error) },
 			{ status: 400, headers: corsHeaders() },
 		);
 	}
 
 	const clientId = generateToken(16);
-	const name = typeof body['client_name'] === 'string' ? body['client_name'] : null;
 
 	await env.MEMORY_DB
 		.prepare('INSERT INTO oauth_clients (id, redirect_uris, name) VALUES (?1, ?2, ?3)')
-		.bind(clientId, (redirectUris as string[]).join(' '), name)
+		.bind(clientId, JSON.stringify(redirectUris), name)
 		.run();
 
 	return Response.json(
@@ -461,7 +574,6 @@ async function handleOAuthRegister(request: Request, env: WorkerEnv): Promise<Re
 async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
 	await ensureOAuthSchema(env.MEMORY_DB);
 
-	// Read params from query string (GET) or form body (POST re-render on error)
 	const qp = url.searchParams;
 	const clientId = qp.get('client_id') ?? '';
 	const redirectUri = qp.get('redirect_uri') ?? '';
@@ -486,7 +598,16 @@ async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL):
 		return Response.json({ error: 'invalid_client', error_description: 'Unknown client_id.' }, { status: 400 });
 	}
 
-	const allowedUris = client.redirect_uris.split(' ').filter(Boolean);
+	let allowedUris: string[];
+	try {
+		allowedUris = parseRedirectUris(client.redirect_uris);
+	} catch (error) {
+		return Response.json(
+			{ error: 'server_error', error_description: error instanceof Error ? error.message : String(error) },
+			{ status: 500 },
+		);
+	}
+
 	if (redirectUri && !allowedUris.includes(redirectUri)) {
 		return Response.json({ error: 'invalid_request', error_description: 'redirect_uri does not match registered URIs.' }, { status: 400 });
 	}
@@ -496,64 +617,75 @@ async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL):
 		return Response.json({ error: 'invalid_request', error_description: 'No redirect_uri available.' }, { status: 400 });
 	}
 
+	if (!codeChallenge) {
+		return Response.json({ error: 'invalid_request', error_description: 'code_challenge is required.' }, { status: 400 });
+	}
+
+	if (codeChallengeMethod !== 'S256') {
+		return Response.json({ error: 'invalid_request', error_description: 'code_challenge_method must be S256.' }, { status: 400 });
+	}
+
 	if (request.method === 'POST') {
 		const formData = await request.formData();
 		const password = formData.get('password') as string | null;
-		const formClientId = (formData.get('client_id') as string | null) ?? clientId;
-		const formRedirectUri = (formData.get('redirect_uri') as string | null) ?? finalRedirectUri;
-		const formState = (formData.get('state') as string | null) ?? state;
-		const formCodeChallenge = (formData.get('code_challenge') as string | null) ?? codeChallenge;
-		const formChallengeMethod = (formData.get('code_challenge_method') as string | null) ?? codeChallengeMethod;
 
 		const sharedToken = env.MCP_SHARED_TOKEN?.trim();
 		if (!sharedToken) {
-			return renderAuthPage(client.name ?? clientId, formClientId, formRedirectUri, formState, formCodeChallenge, formChallengeMethod, 'Server is not configured. Set MCP_SHARED_TOKEN to enable login.');
+			return renderAuthPage(client.name ?? clientId, 'Server is not configured. Set MCP_SHARED_TOKEN to enable login.');
 		}
 
 		if (!password || !constantTimeEqual(password, sharedToken)) {
-			return renderAuthPage(client.name ?? clientId, formClientId, formRedirectUri, formState, formCodeChallenge, formChallengeMethod, 'Incorrect password. Try again.');
+			return renderAuthPage(client.name ?? clientId, 'Incorrect password. Try again.');
 		}
 
-		// Issue authorization code
 		const code = generateToken(32);
 		const expiresAt = new Date(Date.now() + AUTH_CODE_TTL_MS).toISOString();
 
 		await env.MEMORY_DB
 			.prepare('INSERT INTO oauth_codes (code, client_id, redirect_uri, code_challenge, code_challenge_method, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)')
-			.bind(code, formClientId, formRedirectUri, formCodeChallenge || null, formChallengeMethod || null, expiresAt)
+			.bind(code, clientId, finalRedirectUri, codeChallenge, codeChallengeMethod, expiresAt)
 			.run();
 
-		const redirectUrl = new URL(formRedirectUri);
+		const redirectUrl = new URL(finalRedirectUri);
 		redirectUrl.searchParams.set('code', code);
-		if (formState) redirectUrl.searchParams.set('state', formState);
+		if (state) redirectUrl.searchParams.set('state', state);
 
 		return Response.redirect(redirectUrl.toString(), 302);
 	}
 
-	// GET: show login page
-	return renderAuthPage(client.name ?? clientId, clientId, finalRedirectUri, state, codeChallenge, codeChallengeMethod, null);
+	return renderAuthPage(client.name ?? clientId, null);
 }
 
 async function handleOAuthToken(request: Request, env: WorkerEnv): Promise<Response> {
 	await ensureOAuthSchema(env.MEMORY_DB);
 
-	let params: URLSearchParams;
+	let formData: FormData;
 	try {
-		params = new URLSearchParams(await request.text());
+		formData = await request.formData();
 	} catch {
 		return Response.json({ error: 'invalid_request' }, { status: 400, headers: corsHeaders() });
 	}
 
-	if (params.get('grant_type') !== 'authorization_code') {
+	const getField = (name: string) => {
+		const value = formData.get(name);
+		return typeof value === 'string' ? value : '';
+	};
+
+	if (getField('grant_type') !== 'authorization_code') {
 		return Response.json({ error: 'unsupported_grant_type' }, { status: 400, headers: corsHeaders() });
 	}
 
-	const code = params.get('code') ?? '';
-	const redirectUri = params.get('redirect_uri') ?? '';
-	const codeVerifier = params.get('code_verifier') ?? '';
+	const code = getField('code');
+	const clientId = getField('client_id');
+	const redirectUri = getField('redirect_uri');
+	const codeVerifier = getField('code_verifier');
 
 	if (!code) {
 		return Response.json({ error: 'invalid_request', error_description: 'code is required.' }, { status: 400, headers: corsHeaders() });
+	}
+
+	if (!clientId) {
+		return Response.json({ error: 'invalid_request', error_description: 'client_id is required.' }, { status: 400, headers: corsHeaders() });
 	}
 
 	const codeRow = await env.MEMORY_DB
@@ -570,6 +702,10 @@ async function handleOAuthToken(request: Request, env: WorkerEnv): Promise<Respo
 
 	if (new Date(codeRow.expires_at) < new Date()) {
 		return Response.json({ error: 'invalid_grant', error_description: 'Authorization code has expired.' }, { status: 400, headers: corsHeaders() });
+	}
+
+	if (clientId !== codeRow.client_id) {
+		return Response.json({ error: 'invalid_grant', error_description: 'client_id mismatch.' }, { status: 400, headers: corsHeaders() });
 	}
 
 	if (redirectUri && redirectUri !== codeRow.redirect_uri) {
@@ -590,15 +726,21 @@ async function handleOAuthToken(request: Request, env: WorkerEnv): Promise<Respo
 		}
 	}
 
-	// Issue access token
+	const sharedToken = env.MCP_SHARED_TOKEN?.trim();
+	if (!sharedToken) {
+		return Response.json({ error: 'server_error', error_description: 'MCP_SHARED_TOKEN is not configured.' }, { status: 500, headers: corsHeaders() });
+	}
+
+	const secretFingerprint = await sha256Base64Url(sharedToken);
 	const accessToken = generateToken(32);
+	const expiresAt = new Date(Date.now() + ACCESS_TOKEN_TTL_MS).toISOString();
 	await env.MEMORY_DB
-		.prepare('INSERT INTO oauth_tokens (token, client_id) VALUES (?1, ?2)')
-		.bind(accessToken, codeRow.client_id)
+		.prepare('INSERT INTO oauth_tokens (token, client_id, secret_fingerprint, expires_at) VALUES (?1, ?2, ?3, ?4)')
+		.bind(accessToken, codeRow.client_id, secretFingerprint, expiresAt)
 		.run();
 
 	return Response.json(
-		{ access_token: accessToken, token_type: 'bearer' },
+		{ access_token: accessToken, token_type: 'bearer', expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000) },
 		{ headers: corsHeaders() },
 	);
 }

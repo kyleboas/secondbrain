@@ -125,7 +125,10 @@ https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
 
 ## 7.5. Set the MCP auth secret
 
-The Worker now expects bearer auth by default.
+The Worker uses `MCP_SHARED_TOKEN` in two ways:
+
+- as the direct bearer token for scripts and local MCP proxies
+- as the password for the built-in OAuth login flow used by Claude, ChatGPT, and other browser-based clients
 
 Add a Worker secret:
 
@@ -133,7 +136,7 @@ Add a Worker secret:
 npx wrangler secret put MCP_SHARED_TOKEN
 ```
 
-Clients should send:
+Scripts and local proxies can send:
 
 ```text
 Authorization: Bearer <your-token>
@@ -226,7 +229,7 @@ The server fails closed by default unless `ALLOW_UNAUTHENTICATED=true` is explic
 - the raw `MCP_SHARED_TOKEN` value (for scripts and local proxies)
 - an OAuth access token issued through the built-in OAuth flow (for Claude, ChatGPT, and browser-based clients)
 
-OAuth tokens are stored in D1 and have no expiry. To revoke all OAuth sessions, run:
+OAuth tokens are stored in D1, expire automatically, and are invalidated if you rotate `MCP_SHARED_TOKEN`. To revoke all OAuth sessions immediately, run:
 
 ```bash
 npx wrangler d1 execute cloudflare-memory-mcp --remote --command "DELETE FROM oauth_tokens"

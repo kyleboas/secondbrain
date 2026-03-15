@@ -165,6 +165,8 @@ OAuth endpoints:
 | `/oauth/authorize` | Login page — enter your `MCP_SHARED_TOKEN` password |
 | `/oauth/token` | Token exchange (PKCE required) |
 
+Issued OAuth access tokens expire automatically and are also invalidated when you rotate `MCP_SHARED_TOKEN`.
+
 For local demos or deliberately public deployments you can opt out of auth entirely:
 
 ```text
