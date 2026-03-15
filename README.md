@@ -38,11 +38,7 @@ That lets ChatGPT, Claude, Gemini, Zo, or any other MCP client share the same na
    npx wrangler d1 create cloudflare-memory-mcp
    ```
 
-2. Create the OAuth KV namespace:
-
-   ```bash
-   npx wrangler kv namespace create cloudflare-memory-mcp-oauth --binding OAUTH_KV --update-config
-   ```
+2. In the Cloudflare dashboard, create or select a KV namespace for OAuth state and bind it to this Worker as `OAUTH_KV`.
 
 3. Copy the returned `database_id` into `wrangler.jsonc`.
 
@@ -95,6 +91,13 @@ npx wrangler dev --remote
 ## Deployment
 
 This repo does not include a GitHub Actions deploy workflow. Deployment is expected to run from Cloudflare's own build/deploy pipeline or manually via `./deploy.sh`.
+
+If you deploy from Cloudflare's dashboard build pipeline, make sure the Worker has these bindings configured there:
+- `OAUTH_KV` → a KV namespace for OAuth state
+- `MEMORY_DB` → your D1 database
+- `MEMORY_INDEX` → your Vectorize index
+- `AI` → Workers AI binding
+- `SHARED_PASSWORD` → Worker secret
 
 ## Connecting clients
 

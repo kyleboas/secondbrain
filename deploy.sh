@@ -22,13 +22,8 @@ fi
 echo "✅ Authenticated with Cloudflare"
 echo ""
 
-# Create OAuth KV Namespace if config still has placeholder
-if grep -q '00000000000000000000000000000000' wrangler.jsonc; then
-    echo "🔐 Creating OAuth KV namespace 'cloudflare-memory-mcp-oauth'..."
-    wrangler kv namespace create cloudflare-memory-mcp-oauth --binding OAUTH_KV --update-config
-    echo "✅ OAuth KV namespace ready"
-    echo ""
-fi
+echo "ℹ️  Expecting an OAUTH_KV binding to already exist in your Cloudflare Worker settings."
+echo ""
 
 # Create D1 Database
 echo "📦 Creating D1 database 'cloudflare-memory-mcp'..."
