@@ -1,5 +1,7 @@
 # secondbrain
 
+For a step-by-step self-setup guide, see `SETUP.md`.
+
 ## Quick Deploy
 
 Run the deployment script (requires Cloudflare login):
