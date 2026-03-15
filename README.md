@@ -92,33 +92,9 @@ npx wrangler dev --remote
 - `/oauth/register` is the dynamic client registration endpoint
 - `/mcp` is the protected MCP endpoint
 
-## CI/CD Deployment
+## Deployment
 
-The repository includes a GitHub Action that auto-deploys on push to `main`. To enable it:
-
-1. Get your Cloudflare **Account ID** from the Cloudflare dashboard sidebar.
-
-2. Create a Cloudflare **API Token** for the target account with these permissions:
-   - `Workers Scripts:Edit`
-   - `Workers KV Storage:Edit`
-   - `D1:Edit`
-   - `Vectorize:Edit`
-   - `Account:Read`
-
-3. Add these to your GitHub repo:
-   - `CLOUDFLARE_API_TOKEN` as a repository secret
-   - `CLOUDFLARE_ACCOUNT_ID` as either a repository secret or variable
-   - `SHARED_PASSWORD` as a repository secret
-
-The workflow will:
-- Validate that the required Cloudflare settings are present
-- Create or reuse the OAuth KV namespace named `cloudflare-memory-mcp-oauth`
-- Create or reuse the D1 database named `cloudflare-memory-mcp`
-- Create or reuse the Vectorize index named `cloudflare-memory-index`
-- Patch `wrangler.jsonc` at runtime with the real Cloudflare binding IDs
-- Update the `SHARED_PASSWORD` worker secret
-- Apply D1 migrations automatically
-- Deploy the Worker on every push to `main`
+This repo does not include a GitHub Actions deploy workflow. Deployment is expected to run from Cloudflare's own build/deploy pipeline or manually via `./deploy.sh`.
 
 ## Connecting clients
 
