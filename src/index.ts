@@ -11,6 +11,8 @@ const MAX_SOURCE_LENGTH = 512;
 const MAX_QUERY_LENGTH = 512;
 const MAX_TAG_LENGTH = 64;
 const MAX_TAG_COUNT = 16;
+const MAX_AUTO_REMEMBER_TEXT_LENGTH = 12_000;
+const MAX_AUTO_REMEMBER_ITEMS = 8;
 const MAX_REDIRECT_URI_LENGTH = 2_048;
 const MAX_REDIRECT_URI_COUNT = 10;
 const MAX_CLIENT_NAME_LENGTH = 128;
@@ -87,6 +89,22 @@ type OAuthTokenRow = {
 	client_id: string;
 	expires_at: string | null;
 	secret_fingerprint: string | null;
+};
+
+type StoredMemoryResult = {
+	ok: true;
+	id: string;
+	namespace: string;
+	tags: string[];
+	semanticIndexed: boolean;
+	warning?: string;
+};
+
+type AutoRememberCandidate = {
+	content: string;
+	tags: string[];
+	score: number;
+	reason: string;
 };
 
 type WorkerEnv = {
@@ -189,6 +207,30 @@ function normalizeId(value: string) {
 	}
 
 	return trimmed;
+}
+
+function normalizeAutoRememberText(value: string) {
+	const trimmed = value.trim();
+
+	if (trimmed.length === 0) {
+		throw new Error('text cannot be empty.');
+	}
+
+	if (trimmed.length > MAX_AUTO_REMEMBER_TEXT_LENGTH) {
+		throw new Error(`text must be ${MAX_AUTO_REMEMBER_TEXT_LENGTH} characters or fewer.`);
+	}
+
+	return trimmed;
+}
+
+function normalizeAutoRememberItems(value?: number) {
+	const safeValue = value ?? 3;
+
+	if (!Number.isInteger(safeValue) || safeValue < 1 || safeValue > MAX_AUTO_REMEMBER_ITEMS) {
+		throw new Error(`maxItems must be an integer between 1 and ${MAX_AUTO_REMEMBER_ITEMS}.`);
+	}
+
+	return safeValue;
 }
 
 function serializeMemory(row: MemoryRow) {
@@ -377,6 +419,134 @@ function normalizeClientName(value: unknown) {
 	}
 
 	return trimmed;
+}
+
+function collapseWhitespace(value: string) {
+	return value.replace(/\s+/g, ' ').trim();
+}
+
+function splitAutoRememberSegments(text: string) {
+	const lineParts = text
+		.split(/\r?\n+/)
+		.map((line) => collapseWhitespace(line))
+		.filter(Boolean);
+
+	const sentenceParts = collapseWhitespace(text)
+		.split(/(?<=[.!?])\s+/)
+		.map((sentence) => collapseWhitespace(sentence))
+		.filter(Boolean);
+
+	const seen = new Set<string>();
+	return [...lineParts, ...sentenceParts].filter((segment) => {
+		const key = segment.toLowerCase();
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
+		return true;
+	});
+}
+
+function inferAutoRememberTags(segment: string) {
+	const lowered = segment.toLowerCase();
+	const tags: string[] = [];
+
+	if (/\b(my name is|call me|i go by|i am|i'm)\b/.test(lowered)) {
+		tags.push('identity');
+	}
+	if (/\b(i prefer|i like|i love|i dislike|i hate|i avoid|i use|i always|i never)\b/.test(lowered)) {
+		tags.push('preference');
+	}
+	if (/\b(i need to|i want to|my goal is|i plan to|deadline|due\b|ship\b|launch\b|deploy\b)\b/.test(lowered)) {
+		tags.push('goal');
+	}
+	if (/\b(i'm working on|i am working on|we're building|we are building|my project|this repo|secondbrain)\b/.test(lowered)) {
+		tags.push('project');
+	}
+	if (/\b(do not|don't|never|always|must|should|prefer)\b/.test(lowered)) {
+		tags.push('constraint');
+	}
+
+	return tags;
+}
+
+function scoreAutoRememberSegment(segment: string) {
+	const lowered = segment.toLowerCase();
+	let score = 0;
+	let reason = 'general';
+	const hasStrongSignal = /\b(my name is|call me|i go by|i am|i'm|i prefer|i like|i love|i dislike|i hate|i avoid|i use|i always|i never|i need to|i want to|my goal is|i plan to|i'm working on|i am working on|we're building|we are building|my project|remember|please remember)\b/.test(lowered);
+
+	if (segment.length < 10 || segment.length > MAX_CONTENT_LENGTH) {
+		return { score: -100, reason: 'length' };
+	}
+
+	if (segment.length < 18 && !hasStrongSignal) {
+		return { score: -100, reason: 'length' };
+	}
+
+	if (segment.endsWith('?') && !/\b(remember|please remember)\b/.test(lowered)) {
+		return { score: -100, reason: 'question' };
+	}
+
+	if (/^(thanks|thank you|ok|okay|cool|sounds good|got it|sure|yes|no)[.!]?$/i.test(segment)) {
+		return { score: -100, reason: 'filler' };
+	}
+
+	if (/\b(my name is|call me|i go by)\b/.test(lowered)) {
+		score += 6;
+		reason = 'identity';
+	}
+	if (/\b(i prefer|i like|i love|i dislike|i hate|i avoid|i use|i always|i never)\b/.test(lowered)) {
+		score += 5;
+		reason = reason === 'general' ? 'preference' : reason;
+	}
+	if (/\b(i need to|i want to|my goal is|i plan to|deadline|due\b|ship\b|launch\b|deploy\b)\b/.test(lowered)) {
+		score += 4;
+		reason = reason === 'general' ? 'goal' : reason;
+	}
+	if (/\b(i'm working on|i am working on|we're building|we are building|my project)\b/.test(lowered)) {
+		score += 4;
+		reason = reason === 'general' ? 'project' : reason;
+	}
+	if (/\b(remember|please remember)\b/.test(lowered)) {
+		score += 6;
+		reason = 'explicit';
+	}
+	if (/\b(do not|don't|never|always|must|should)\b/.test(lowered)) {
+		score += 2;
+	}
+
+	if (!/[a-z]/i.test(segment)) {
+		score -= 100;
+	}
+
+	return { score, reason };
+}
+
+function extractAutoRememberCandidates(text: string, maxItems: number) {
+	const candidates = splitAutoRememberSegments(text)
+		.map((segment) => {
+			const normalized = collapseWhitespace(segment);
+			const { score, reason } = scoreAutoRememberSegment(normalized);
+			return {
+				content: normalized,
+				tags: inferAutoRememberTags(normalized),
+				score,
+				reason,
+			} satisfies AutoRememberCandidate;
+		})
+		.filter((candidate) => candidate.score >= 4)
+		.sort((left, right) => right.score - left.score || left.content.length - right.content.length);
+
+	const seen = new Set<string>();
+	return candidates.filter((candidate) => {
+		const key = candidate.content.toLowerCase();
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
+		return true;
+	}).slice(0, maxItems);
 }
 
 function htmlEscape(str: string): string {
@@ -745,6 +915,146 @@ async function handleOAuthToken(request: Request, env: WorkerEnv): Promise<Respo
 	);
 }
 
+async function findExistingMemoryByContent(env: WorkerEnv, namespace: string, content: string) {
+	const row = await env.MEMORY_DB
+		.prepare(
+			`SELECT id, namespace, content, tags, source, created_at
+			 FROM memories
+			 WHERE namespace = ?1
+			   AND content = ?2
+			 LIMIT 1`,
+		)
+		.bind(namespace, content)
+		.first<MemoryRow>();
+
+	return row ?? null;
+}
+
+async function storeMemory(
+	env: WorkerEnv,
+	input: { namespace?: string; content: string; tags?: string[]; source?: string },
+): Promise<StoredMemoryResult> {
+	await ensureSchema(env.MEMORY_DB);
+
+	const id = crypto.randomUUID();
+	const normalizedNamespace = validateNamespace(input.namespace);
+	const normalizedTags = normalizeTags(input.tags);
+	const normalizedTagString = normalizedTags.join(',');
+	const trimmedContent = normalizeContent(input.content);
+	const trimmedSource = normalizeSource(input.source);
+
+	await env.MEMORY_DB.prepare(
+		`INSERT INTO memories (id, namespace, content, tags, source)
+		 VALUES (?1, ?2, ?3, ?4, ?5)`,
+	)
+		.bind(id, normalizedNamespace, trimmedContent, normalizedTagString, trimmedSource)
+		.run();
+
+	let semanticIndexed = false;
+	let warning: string | undefined;
+
+	try {
+		const embedding = await embedText(env, [trimmedContent, trimmedSource, normalizedTagString].filter(Boolean).join('\n'));
+		await env.MEMORY_INDEX.upsert([
+			{
+				id,
+				namespace: normalizedNamespace,
+				values: embedding,
+				metadata: {
+					source: trimmedSource ?? '',
+					tags: normalizedTags,
+				},
+			},
+		]);
+		semanticIndexed = true;
+	} catch (error) {
+		warning = error instanceof Error ? error.message : String(error);
+	}
+
+	return {
+		ok: true,
+		id,
+		namespace: normalizedNamespace,
+		tags: normalizedTags,
+		semanticIndexed,
+		...(warning ? { warning } : {}),
+	};
+}
+
+async function autoRemember(
+	env: WorkerEnv,
+	input: {
+		namespace?: string;
+		text: string;
+		tags?: string[];
+		source?: string;
+		maxItems?: number;
+		dryRun?: boolean;
+	},
+) {
+	await ensureSchema(env.MEMORY_DB);
+
+	const normalizedNamespace = validateNamespace(input.namespace);
+	const normalizedText = normalizeAutoRememberText(input.text);
+	const normalizedSource = normalizeSource(input.source) ?? undefined;
+	const baseTags = normalizeTags(input.tags);
+	const safeMaxItems = normalizeAutoRememberItems(input.maxItems);
+	const candidates = extractAutoRememberCandidates(normalizedText, safeMaxItems);
+
+	if (input.dryRun) {
+		return {
+			ok: true,
+			dryRun: true,
+			namespace: normalizedNamespace,
+			count: candidates.length,
+			items: candidates.map((candidate) => ({
+				content: candidate.content,
+				tags: normalizeTags([...baseTags, ...candidate.tags]),
+				score: candidate.score,
+				reason: candidate.reason,
+			})),
+		};
+	}
+
+	const saved: Array<StoredMemoryResult & { content: string; reason: string }> = [];
+	const skipped: Array<{ content: string; reason: string; existingId?: string }> = [];
+
+	for (const candidate of candidates) {
+		const existing = await findExistingMemoryByContent(env, normalizedNamespace, candidate.content);
+		if (existing) {
+			skipped.push({
+				content: candidate.content,
+				reason: 'duplicate',
+				existingId: existing.id,
+			});
+			continue;
+		}
+
+		const stored = await storeMemory(env, {
+			namespace: normalizedNamespace,
+			content: candidate.content,
+			tags: [...baseTags, ...candidate.tags],
+			source: normalizedSource,
+		});
+
+		saved.push({
+			...stored,
+			content: candidate.content,
+			reason: candidate.reason,
+		});
+	}
+
+	return {
+		ok: true,
+		namespace: normalizedNamespace,
+		analyzed: candidates.length,
+		savedCount: saved.length,
+		skippedCount: skipped.length,
+		saved,
+		skipped,
+	};
+}
+
 function createServer(env: WorkerEnv) {
 	const server = new McpServer({
 		name: 'cloudflare-memory-mcp',
@@ -761,56 +1071,42 @@ function createServer(env: WorkerEnv) {
 			source: z.string().optional(),
 		},
 		async ({ namespace, content, tags, source }) => {
-			await ensureSchema(env.MEMORY_DB);
-
-			const id = crypto.randomUUID();
-			const normalizedNamespace = validateNamespace(namespace);
-			const normalizedTags = normalizeTags(tags);
-			const normalizedTagString = normalizedTags.join(',');
-			const trimmedContent = normalizeContent(content);
-			const trimmedSource = normalizeSource(source);
-
-			await env.MEMORY_DB.prepare(
-				`INSERT INTO memories (id, namespace, content, tags, source)
-				 VALUES (?1, ?2, ?3, ?4, ?5)`,
-			)
-				.bind(id, normalizedNamespace, trimmedContent, normalizedTagString, trimmedSource)
-				.run();
-
-			let semanticIndexed = false;
-			let warning: string | undefined;
-
-			try {
-				const embedding = await embedText(env, [trimmedContent, trimmedSource, normalizedTagString].filter(Boolean).join('\n'));
-				await env.MEMORY_INDEX.upsert([
-					{
-						id,
-						namespace: normalizedNamespace,
-						values: embedding,
-						metadata: {
-							source: trimmedSource ?? '',
-							tags: normalizedTags,
-						},
-					},
-				]);
-				semanticIndexed = true;
-			} catch (error) {
-				warning = error instanceof Error ? error.message : String(error);
-			}
+			const stored = await storeMemory(env, { namespace, content, tags, source });
 
 			return {
 				content: [
 					{
 						type: 'text',
 						text: JSON.stringify(
-							{
-								ok: true,
-								id,
-								namespace: normalizedNamespace,
-								tags: normalizedTags,
-								semanticIndexed,
-								...(warning ? { warning } : {}),
-							},
+							stored,
+							null,
+							2,
+						),
+					},
+				],
+			};
+		},
+		);
+
+	server.tool(
+		'auto_remember',
+		'Extract likely durable memories from raw conversation text, then preview or store them conservatively.',
+		{
+			namespace: z.string().optional(),
+			text: z.string().min(1),
+			tags: z.array(z.string()).optional(),
+			source: z.string().optional(),
+			maxItems: z.number().int().min(1).max(MAX_AUTO_REMEMBER_ITEMS).optional(),
+			dryRun: z.boolean().optional(),
+		},
+		async ({ namespace, text, tags, source, maxItems, dryRun }) => {
+			const result = await autoRemember(env, { namespace, text, tags, source, maxItems, dryRun });
+			return {
+				content: [
+					{
+						type: 'text',
+						text: JSON.stringify(
+							result,
 							null,
 							2,
 						),
@@ -1072,6 +1368,11 @@ async function querySemanticMemories(env: WorkerEnv, namespace: string, query: s
 		}));
 }
 
+export const internals = {
+	extractAutoRememberCandidates,
+	autoRemember,
+};
+
 export default {
 	async fetch(request, env: WorkerEnv, ctx): Promise<Response> {
 		const url = new URL(request.url);
@@ -1148,15 +1449,15 @@ export default {
 			}
 		}
 
-		if (url.pathname === '/') {
-			return Response.json({
-				name: 'cloudflare-memory-mcp',
-				endpoint: '/mcp',
-				authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
-				tools: ['remember', 'recall', 'forget', 'list_namespaces'],
-				note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall.',
-			});
-		}
+			if (url.pathname === '/') {
+				return Response.json({
+					name: 'cloudflare-memory-mcp',
+					endpoint: '/mcp',
+					authenticated: !isTruthy(env.ALLOW_UNAUTHENTICATED),
+					tools: ['remember', 'auto_remember', 'recall', 'forget', 'list_namespaces'],
+					note: 'Shared memory is hybrid: D1 stores canonical records and Vectorize handles semantic recall.',
+				});
+			}
 
 		return new Response('Not Found', { status: 404 });
 	},
