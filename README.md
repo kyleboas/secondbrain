@@ -32,13 +32,14 @@ When you **remember** something, it is written to both D1 and Vectorize. When yo
 
 ### Tools
 
-The server exposes five MCP tools:
+The server exposes six MCP tools:
 
 | Tool | Description |
 |------|-------------|
+| `lookup_memory` | Preferred read tool for chat clients; checks saved memory before answering a user request |
 | `auto_remember` | Preferred write tool for chat clients; extracts likely durable memories from raw conversation text, then previews or stores them conservatively |
 | `remember` | Save one already-distilled memory with optional tags, namespace, and source reference |
-| `recall` | Search or list memories using semantic + keyword hybrid retrieval |
+| `recall` | Low-level direct memory search using semantic + keyword hybrid retrieval |
 | `forget` | Delete a specific memory by namespace and ID |
 | `list_namespaces` | List all namespaces with memory counts |
 
@@ -179,7 +180,8 @@ That should be treated as a temporary development setting, not normal production
 
 ## Notes
 
-- `recall` blends semantic matches from Vectorize with keyword matches from D1.
+- `lookup_memory` is the preferred read path for normal chat turns where the model should check saved context before answering.
+- `recall` blends semantic matches from Vectorize with keyword matches from D1, but it is now positioned as the lower-level direct search fallback.
 - `forget` now deletes within a namespace, so callers must provide both `namespace` and `id`.
 - `auto_remember` is explicit, not ambient: a client has to call it with conversation text before anything is stored automatically, but it is now described as the preferred write path for chat transcripts so clients have a stronger default cue.
 - Input sizes are capped to reduce abuse and accidental AI/storage blowups.

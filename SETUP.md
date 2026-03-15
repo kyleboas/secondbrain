@@ -210,6 +210,10 @@ https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
 5. ChatGPT will redirect you to the secondbrain login page — enter your `MCP_SHARED_TOKEN` password.
 6. After authorizing, open a new chat and enable the connector from the tools picker.
 
+For best results, the server now advertises:
+- `lookup_memory` as the preferred read tool before answering
+- `auto_remember` as the preferred write tool for raw chat transcripts
+
 ### 9.3. Other clients and scripts
 
 The server still accepts the raw `MCP_SHARED_TOKEN` as a bearer token, so scripts, `curl`, and local MCP proxies continue to work without any changes:
@@ -220,7 +224,18 @@ Authorization: Bearer <your-MCP_SHARED_TOKEN>
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
-### 9.4. Using `auto_remember`
+### 9.4. Using `lookup_memory`
+
+`lookup_memory` is the tool to use when a client should check saved context before answering a user request.
+
+Important:
+
+- it is the preferred read tool for normal chat turns
+- pass the latest user message as `query`
+- it returns semantically relevant memories plus keyword matches from the same namespace
+- clients should use only clearly relevant matches and ignore unrelated ones
+
+### 9.5. Using `auto_remember`
 
 `auto_remember` is the tool to use when you want a client to save likely durable memories from a block of conversation text.
 
