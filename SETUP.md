@@ -173,6 +173,80 @@ Examples:
 
 If a client does not support remote MCP directly, use a local proxy such as `mcp-remote`.
 
+### 9.1. Choose an auth mode before connecting ChatGPT or Claude
+
+This repo now defaults to a shared bearer token via `MCP_SHARED_TOKEN`.
+
+That works well for manual clients, scripts, `curl`, and local MCP proxies that let you set an `Authorization` header yourself.
+
+For ChatGPT and Claude, the smoother direct setup is usually one of these:
+
+- temporary demo mode with `ALLOW_UNAUTHENTICATED=true`
+- an OAuth front door in front of the Worker
+
+If you leave the server in bearer-token mode, make sure the client you are using can actually supply `Authorization: Bearer <your-token>` during MCP connection setup.
+
+### 9.2. ChatGPT setup
+
+ChatGPT's MCP/custom connector support changes by plan:
+
+- Plus and Pro can use custom connectors, but Plus/Pro users must enable developer mode first
+- Business, Enterprise, and Edu can use custom connectors too, but workspace admins may need to enable developer mode or grant access first
+- full write/modify MCP support is documented for Business, Enterprise, and Edu workspaces; if your plan only exposes read/fetch access, expect `recall` and `list_namespaces` to work before `remember` and `forget`
+
+Recommended setup flow:
+
+1. Confirm you are using ChatGPT web and that developer mode is enabled for your account or workspace.
+2. Open the custom app / custom connector creation flow in ChatGPT settings.
+3. Paste your remote MCP endpoint:
+
+```text
+https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
+```
+
+4. Pick the authentication method.
+5. If you want the easiest first connection test, temporarily set `ALLOW_UNAUTHENTICATED=true` on the Worker, connect ChatGPT, confirm the tools appear, then move to a stronger auth setup.
+6. If you want production access, prefer an OAuth-based setup in front of the Worker rather than relying on a shared bearer token.
+7. After the connector is saved, open a new chat and use the tools / connectors picker to enable it.
+
+If ChatGPT says the MCP server does not match its expected spec, treat that as a compatibility issue in the connector integration itself, not as a Cloudflare deployment problem.
+
+### 9.3. Claude setup
+
+Custom remote MCP connectors are available in Claude and Claude Desktop on paid Claude plans.
+
+Recommended setup flow:
+
+1. Open Claude or Claude Desktop.
+2. Go to `Settings -> Connectors`.
+3. Add a custom remote MCP server.
+4. Paste your endpoint:
+
+```text
+https://cloudflare-memory-mcp.<your-subdomain>.workers.dev/mcp
+```
+
+5. If Claude prompts for auth, use an authless or OAuth-based setup that Claude supports.
+6. Enable only the tools you actually want Claude to use.
+7. Start a new conversation and invoke the connector from Claude's tools / connectors UI.
+
+Important Claude-specific notes:
+
+- for Claude Desktop, remote MCP servers must be added through `Settings -> Connectors`, not through `claude_desktop_config.json`
+- Claude mobile can use remote servers that were already added through Claude web, but you cannot add a new one directly from mobile
+- Claude officially documents authless and OAuth-based remote MCP support, so those are the safest connection modes to target
+
+### 9.4. Practical recommendation
+
+If your goal is just to prove the server works in ChatGPT and Claude:
+
+1. temporarily set `ALLOW_UNAUTHENTICATED=true`
+2. connect each client
+3. verify that `remember`, `recall`, `forget`, and `list_namespaces` appear
+4. then replace demo mode with a stronger production auth layer
+
+If your goal is production use, do not leave the endpoint public. Put OAuth or another supported auth layer in front of it before you rely on it.
+
 ## Current security model
 
 This project now fails closed by default unless `ALLOW_UNAUTHENTICATED=true` is explicitly set.
