@@ -286,6 +286,77 @@ describe('cloudflare-memory-mcp worker', () => {
 		);
 	});
 
+	it('exposes memory-instructions prompt via prompts/list and prompts/get', async () => {
+		const sharedEnv = { ...env, MCP_SHARED_TOKEN: 'top-secret' };
+
+		const listResponse = await fetchWithEnv(
+			'http://example.com/mcp',
+			{
+				method: 'POST',
+				headers: {
+					Accept: 'application/json, text/event-stream',
+					'Content-Type': 'application/json',
+					Authorization: 'Bearer top-secret',
+				},
+				body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'prompts/list', params: {} }),
+			},
+			sharedEnv,
+		);
+
+		const listText = await listResponse.text();
+		const listPayloads = listText
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith('data:'))
+			.map((line) => {
+				try { return JSON.parse(line.slice(5).trim()); } catch { return null; }
+			})
+			.filter(Boolean);
+
+		const listBody = listPayloads.find((p: { result?: { prompts?: unknown[] } }) => p?.result?.prompts) as
+			| { result: { prompts: Array<{ name: string; description?: string }> } }
+			| undefined;
+
+		const prompts = listBody?.result?.prompts ?? [];
+		expect(prompts.find((p) => p.name === 'memory-instructions')).toBeTruthy();
+
+		const getResponse = await fetchWithEnv(
+			'http://example.com/mcp',
+			{
+				method: 'POST',
+				headers: {
+					Accept: 'application/json, text/event-stream',
+					'Content-Type': 'application/json',
+					Authorization: 'Bearer top-secret',
+				},
+				body: JSON.stringify({
+					jsonrpc: '2.0',
+					id: 2,
+					method: 'prompts/get',
+					params: { name: 'memory-instructions' },
+				}),
+			},
+			sharedEnv,
+		);
+
+		const getText = await getResponse.text();
+		const getPayloads = getText
+			.split(/\r?\n/)
+			.filter((line) => line.startsWith('data:'))
+			.map((line) => {
+				try { return JSON.parse(line.slice(5).trim()); } catch { return null; }
+			})
+			.filter(Boolean);
+
+		const getBody = getPayloads.find((p: { result?: { messages?: unknown[] } }) => p?.result?.messages) as
+			| { result: { messages: Array<{ role: string; content: { type: string; text: string } }> } }
+			| undefined;
+
+		const messages = getBody?.result?.messages ?? [];
+		expect(messages.length).toBeGreaterThan(0);
+		expect(messages[0].content.text).toContain('lookup_memory');
+		expect(messages[0].content.text).toContain('auto_remember');
+	});
+
 	it('auto_remember previews likely memories without storing them in dry-run mode', async () => {
 		const sharedEnv = createMemoryTestEnv();
 		const result = await internals.autoRemember(sharedEnv, {
