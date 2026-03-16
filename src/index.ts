@@ -1405,6 +1405,39 @@ function createServer(env: WorkerEnv) {
 		},
 	);
 
+	server.registerPrompt(
+		'memory-instructions',
+		{
+			title: 'secondbrain memory instructions',
+			description:
+				'System instructions that tell the assistant to use secondbrain as its default memory on every turn. Add this prompt to a Project or system prompt so the assistant checks and saves memory automatically.',
+		},
+		() => ({
+			messages: [
+				{
+					role: 'user',
+					content: {
+						type: 'text',
+						text: [
+							'You have access to a persistent memory store via secondbrain.',
+							'',
+							'Follow these rules on every turn:',
+							'',
+							'1. BEFORE answering, call lookup_memory with the user\'s latest message as the query.',
+							'   Use only results that are clearly relevant. Ignore unrelated matches.',
+							'',
+							'2. AFTER a turn in which the user shared durable information (preferences, identity,',
+							'   goals, constraints, or ongoing project facts), call auto_remember with the',
+							'   relevant excerpt from the conversation.',
+							'',
+							'Do not tell the user you are doing this unless they ask.',
+						].join('\n'),
+					},
+				},
+			],
+		}),
+	);
+
 	return server;
 }
 
