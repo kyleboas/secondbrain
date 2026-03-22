@@ -315,15 +315,11 @@ function isTruthy(value?: string) {
 	return ['1', 'true', 'yes', 'on'].includes(value?.trim().toLowerCase() ?? '');
 }
 
-function constantTimeEqual(left: string, right: string) {
-	const leftBytes = Buffer.from(left);
-	const rightBytes = Buffer.from(right);
-
-	if (leftBytes.length !== rightBytes.length) {
-		return false;
-	}
-
-	return timingSafeEqual(leftBytes, rightBytes);
+async function constantTimeEqual(left: string, right: string) {
+	const encoder = new TextEncoder();
+	const leftDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(left)));
+	const rightDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(right)));
+	return timingSafeEqual(leftDigest, rightDigest);
 }
 
 function generateToken(bytes = 32): string {
@@ -342,7 +338,7 @@ async function verifyPkceChallenge(verifier: string, challenge: string): Promise
 		.replace(/\+/g, '-')
 		.replace(/\//g, '_')
 		.replace(/=/g, '');
-	return base64url === challenge;
+	return constantTimeEqual(base64url, challenge);
 }
 
 function base64UrlEncode(bytes: Uint8Array) {
@@ -446,6 +442,10 @@ function normalizeClientName(value: unknown) {
 	}
 
 	return trimmed;
+}
+
+function escapeLikePattern(value: string) {
+	return value.replace(/[%_\\]/g, '\\$&');
 }
 
 function collapseWhitespace(value: string) {
@@ -648,7 +648,7 @@ async function authorizeRequest(request: Request, env: WorkerEnv) {
 	const token = authorization?.startsWith('Bearer ') ? authorization.slice(7).trim() : null;
 
 	// Fast path: shared bearer token (backward compatible)
-	if (token && sharedToken && constantTimeEqual(token, sharedToken)) {
+	if (token && sharedToken && (await constantTimeEqual(token, sharedToken))) {
 		return { ok: true as const };
 	}
 
@@ -665,7 +665,7 @@ async function authorizeRequest(request: Request, env: WorkerEnv) {
 				await env.MEMORY_DB.prepare('DELETE FROM oauth_tokens WHERE token = ?1').bind(token).run();
 			} else if (new Date(row.expires_at) < new Date()) {
 				await env.MEMORY_DB.prepare('DELETE FROM oauth_tokens WHERE token = ?1').bind(token).run();
-			} else if (constantTimeEqual(row.secret_fingerprint, secretFingerprint)) {
+			} else if (await constantTimeEqual(row.secret_fingerprint, secretFingerprint)) {
 				return { ok: true as const };
 			}
 		}
@@ -697,7 +697,7 @@ async function authorizeRequest(request: Request, env: WorkerEnv) {
 	};
 }
 
-function renderAuthPage(clientName: string, error: string | null): Response {
+function renderAuthPage(clientName: string, error: string | null, csrfToken?: string): Response {
 	const html = `<!DOCTYPE html>
 	<html lang="en">
 <head>
@@ -725,6 +725,7 @@ function renderAuthPage(clientName: string, error: string | null): Response {
 			<p class="subtitle">Authorizing <strong>${htmlEscape(clientName)}</strong> to access your memories.</p>
 			${error ? `<div class="error">${htmlEscape(error)}</div>` : ''}
 			<form method="POST">
+				${csrfToken ? `<input type="hidden" name="csrf_token" value="${htmlEscape(csrfToken)}">` : ''}
 				<label for="password">Admin password</label>
 				<input type="password" id="password" name="password" autocomplete="current-password" autofocus required>
 				<button type="submit">Authorize access</button>
@@ -735,7 +736,14 @@ function renderAuthPage(clientName: string, error: string | null): Response {
 
 	return new Response(html, {
 		status: error ? 400 : 200,
-		headers: { 'Content-Type': 'text/html; charset=utf-8' },
+		headers: {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+			'X-Content-Type-Options': 'nosniff',
+			'X-Frame-Options': 'DENY',
+			'Referrer-Policy': 'no-referrer',
+			'Cache-Control': 'no-store',
+		},
 	});
 }
 
@@ -779,6 +787,19 @@ async function handleOAuthRegister(request: Request, env: WorkerEnv): Promise<Re
 		},
 		{ status: 201, headers: corsHeaders() },
 	);
+}
+
+async function generateCsrfToken(clientId: string, codeChallenge: string, secret: string) {
+	const encoder = new TextEncoder();
+	const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+	const data = encoder.encode(`csrf:${clientId}:${codeChallenge}`);
+	const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
+	return base64UrlEncode(signature);
+}
+
+async function verifyCsrfToken(token: string, clientId: string, codeChallenge: string, secret: string) {
+	const expected = await generateCsrfToken(clientId, codeChallenge, secret);
+	return constantTimeEqual(token, expected);
 }
 
 async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL): Promise<Response> {
@@ -835,17 +856,25 @@ async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL):
 		return Response.json({ error: 'invalid_request', error_description: 'code_challenge_method must be S256.' }, { status: 400 });
 	}
 
+	const sharedToken = env.MCP_SHARED_TOKEN?.trim();
+
 	if (request.method === 'POST') {
 		const formData = await request.formData();
 		const password = formData.get('password') as string | null;
+		const csrfToken = (formData.get('csrf_token') as string | null) ?? '';
 
-		const sharedToken = env.MCP_SHARED_TOKEN?.trim();
 		if (!sharedToken) {
 			return renderAuthPage(client.name ?? clientId, 'Server is not configured. Set MCP_SHARED_TOKEN to enable login.');
 		}
 
-		if (!password || !constantTimeEqual(password, sharedToken)) {
-			return renderAuthPage(client.name ?? clientId, 'Incorrect password. Try again.');
+		if (!csrfToken || !(await verifyCsrfToken(csrfToken, clientId, codeChallenge, sharedToken))) {
+			const newCsrf = await generateCsrfToken(clientId, codeChallenge, sharedToken);
+			return renderAuthPage(client.name ?? clientId, 'Invalid or expired form submission. Please try again.', newCsrf);
+		}
+
+		if (!password || !(await constantTimeEqual(password, sharedToken))) {
+			const newCsrf = await generateCsrfToken(clientId, codeChallenge, sharedToken);
+			return renderAuthPage(client.name ?? clientId, 'Incorrect password. Try again.', newCsrf);
 		}
 
 		const code = generateToken(32);
@@ -863,11 +892,20 @@ async function handleOAuthAuthorize(request: Request, env: WorkerEnv, url: URL):
 		return Response.redirect(redirectUrl.toString(), 302);
 	}
 
-	return renderAuthPage(client.name ?? clientId, null);
+	const csrfToken = sharedToken ? await generateCsrfToken(clientId, codeChallenge, sharedToken) : undefined;
+	return renderAuthPage(client.name ?? clientId, null, csrfToken);
+}
+
+async function cleanupExpiredOAuthEntries(db: D1Database) {
+	const now = new Date().toISOString();
+	await db.prepare('DELETE FROM oauth_codes WHERE expires_at < ?1').bind(now).run();
+	await db.prepare('DELETE FROM oauth_tokens WHERE expires_at < ?1').bind(now).run();
 }
 
 async function handleOAuthToken(request: Request, env: WorkerEnv): Promise<Response> {
 	await ensureOAuthSchema(env.MEMORY_DB);
+	// Proactively clean up expired codes and tokens to prevent unbounded growth
+	await cleanupExpiredOAuthEntries(env.MEMORY_DB);
 
 	let formData: FormData;
 	try {
@@ -1477,17 +1515,19 @@ async function queryRecentMemories(env: WorkerEnv, namespace: string, tag: strin
 		`SELECT id, namespace, content, tags, source, created_at
 		 FROM memories
 		 WHERE namespace = ?1
-		   AND (?2 = '' OR tags LIKE '%' || ?2 || '%')
+		   AND (?2 = '' OR tags LIKE '%' || ?2 || '%' ESCAPE '\\')
 		 ORDER BY created_at DESC
 		 LIMIT ?3`,
 	)
-		.bind(namespace, tag, limit)
+		.bind(namespace, escapeLikePattern(tag), limit)
 		.all<MemoryRow>();
 
 	return results;
 }
 
 async function queryKeywordMemories(env: WorkerEnv, namespace: string, query: string, tag: string, limit: number) {
+	const escapedQuery = escapeLikePattern(query);
+	const escapedTag = escapeLikePattern(tag);
 	const { results } = await env.MEMORY_DB.prepare(
 		`SELECT
 			id,
@@ -1497,22 +1537,22 @@ async function queryKeywordMemories(env: WorkerEnv, namespace: string, query: st
 			source,
 			created_at,
 			(
-				CASE WHEN lower(content) LIKE '%' || ?2 || '%' THEN 2 ELSE 0 END +
-				CASE WHEN lower(tags) LIKE '%' || ?2 || '%' THEN 1 ELSE 0 END +
-				CASE WHEN lower(COALESCE(source, '')) LIKE '%' || ?2 || '%' THEN 1 ELSE 0 END
+				CASE WHEN lower(content) LIKE '%' || ?2 || '%' ESCAPE '\\' THEN 2 ELSE 0 END +
+				CASE WHEN lower(tags) LIKE '%' || ?2 || '%' ESCAPE '\\' THEN 1 ELSE 0 END +
+				CASE WHEN lower(COALESCE(source, '')) LIKE '%' || ?2 || '%' ESCAPE '\\' THEN 1 ELSE 0 END
 			) AS score
 		 FROM memories
 		 WHERE namespace = ?1
 		   AND (
-			 lower(content) LIKE '%' || ?2 || '%'
-			 OR lower(tags) LIKE '%' || ?2 || '%'
-			 OR lower(COALESCE(source, '')) LIKE '%' || ?2 || '%'
+			 lower(content) LIKE '%' || ?2 || '%' ESCAPE '\\'
+			 OR lower(tags) LIKE '%' || ?2 || '%' ESCAPE '\\'
+			 OR lower(COALESCE(source, '')) LIKE '%' || ?2 || '%' ESCAPE '\\'
 		   )
-		   AND (?3 = '' OR lower(tags) LIKE '%' || ?3 || '%')
+		   AND (?3 = '' OR lower(tags) LIKE '%' || ?3 || '%' ESCAPE '\\')
 		 ORDER BY score DESC, created_at DESC
 		 LIMIT ?4`,
 	)
-		.bind(namespace, query, tag, limit)
+		.bind(namespace, escapedQuery, escapedTag, limit)
 		.all<MemoryRow>();
 
 	return results;
