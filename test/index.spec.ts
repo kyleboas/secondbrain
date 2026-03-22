@@ -453,8 +453,17 @@ describe('cloudflare-memory-mcp worker', () => {
 		const registration = await registerResponse.json() as { client_id: string };
 		expect(registration.client_id).toBeTruthy();
 
+		// GET the authorize page to obtain the CSRF token
+		const authorizePageUrl = `http://example.com/oauth/authorize?response_type=code&client_id=${encodeURIComponent(registration.client_id)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=xyz&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`;
+		const authorizePage = await fetchWithEnv(authorizePageUrl, { method: 'GET' }, sharedEnv);
+		expect(authorizePage.status).toBe(200);
+		const pageHtml = await authorizePage.text();
+		const csrfMatch = pageHtml.match(/name="csrf_token"\s+value="([^"]+)"/);
+		expect(csrfMatch).toBeTruthy();
+		const csrfToken = csrfMatch![1];
+
 		const authorizeResponse = await fetchWithEnv(
-			`http://example.com/oauth/authorize?response_type=code&client_id=${encodeURIComponent(registration.client_id)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=xyz&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+			authorizePageUrl,
 			{
 				method: 'POST',
 				headers: {
@@ -462,6 +471,7 @@ describe('cloudflare-memory-mcp worker', () => {
 				},
 				body: new URLSearchParams({
 					password: 'top-secret',
+					csrf_token: csrfToken,
 					client_id: 'tampered-client',
 					redirect_uri: 'https://evil.example/callback',
 					code_challenge: 'tampered-challenge',
