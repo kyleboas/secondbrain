@@ -1,5 +1,7 @@
 ![](./assets/logo.png)
 
+> This is a work in progress. Things may break.
+
 # secondbrain
 
 A shared memory server for your AI tools. Built on [Cloudflare Workers](https://workers.cloudflare.com/) and the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), secondbrain gives ChatGPT, Claude, Gemini, and any other MCP-compatible client a single place to store and retrieve memories -- so context learned in one tool is available everywhere.
