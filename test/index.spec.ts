@@ -157,6 +157,68 @@ describe('cloudflare-memory-mcp worker', () => {
 		});
 	});
 
+	it('starts keyword and semantic lookup in parallel', async () => {
+		const sharedEnv = createMemoryTestEnv();
+		const baseDb = sharedEnv.MEMORY_DB;
+		let keywordStarted = false;
+		let semanticStarted = false;
+		let releaseGate: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+
+		const parallelEnv = {
+			...sharedEnv,
+			MEMORY_DB: {
+				prepare: (query: string) => {
+					if (query.includes('lower(content) LIKE')) {
+						return {
+							bind: () => ({
+								all: async () => {
+									keywordStarted = true;
+									await gate;
+									return { results: [] };
+								},
+							}),
+						} as ReturnType<typeof baseDb.prepare>;
+					}
+					return baseDb.prepare(query);
+				},
+			} as typeof sharedEnv.MEMORY_DB,
+			AI: {
+				run: async () => {
+					semanticStarted = true;
+					await gate;
+					return { data: [[0.1, 0.2, 0.3]] };
+				},
+			} as typeof sharedEnv.AI,
+		} as TestEnv;
+
+		const lookupPromise = fetchWithEnv(
+			'http://example.com/api/memory/lookup',
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer top-secret',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					namespace: 'profile-api',
+					query: 'parallel lookup please',
+				}),
+			},
+			parallelEnv,
+		);
+
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(keywordStarted).toBe(true);
+		expect(semanticStarted).toBe(true);
+
+		releaseGate?.();
+		const lookupResponse = await lookupPromise;
+		expect(lookupResponse.status).toBe(200);
+	});
+
 	it('falls back to semantic lookup when keyword search fails', async () => {
 		const sharedEnv = createMemoryTestEnv();
 		const baseDb = sharedEnv.MEMORY_DB;

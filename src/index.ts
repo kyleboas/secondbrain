@@ -1155,31 +1155,32 @@ async function recallMemories(
 	if (normalizedQuery.length === 0) {
 		results = await queryRecentMemories(env, normalizedNamespace, normalizedTag, safeLimit);
 	} else {
-		let keywordResults: MemoryRow[] = [];
-		let semanticResults: MemoryRow[] = [];
-
-		try {
-			keywordResults = await queryKeywordMemories(
+		const [keywordOutcome, semanticOutcome] = await Promise.allSettled([
+			queryKeywordMemories(
 				env,
 				normalizedNamespace,
 				normalizedQuery,
 				normalizedTag,
 				safeLimit,
-			);
-		} catch (error) {
-			warnings.push(error instanceof Error ? error.message : String(error));
+			),
+			querySemanticMemories(
+				env,
+				normalizedNamespace,
+				normalizedQuery,
+				normalizedTag,
+				safeLimit,
+			),
+		]);
+
+		const keywordResults = keywordOutcome.status === 'fulfilled' ? keywordOutcome.value : [];
+		const semanticResults = semanticOutcome.status === 'fulfilled' ? semanticOutcome.value : [];
+
+		if (keywordOutcome.status === 'rejected') {
+			warnings.push(keywordOutcome.reason instanceof Error ? keywordOutcome.reason.message : String(keywordOutcome.reason));
 		}
 
-		try {
-			semanticResults = await querySemanticMemories(
-				env,
-				normalizedNamespace,
-				normalizedQuery,
-				normalizedTag,
-				safeLimit,
-			);
-		} catch (error) {
-			warnings.push(error instanceof Error ? error.message : String(error));
+		if (semanticOutcome.status === 'rejected') {
+			warnings.push(semanticOutcome.reason instanceof Error ? semanticOutcome.reason.message : String(semanticOutcome.reason));
 		}
 
 		results = uniqueById([...semanticResults, ...keywordResults]).slice(0, safeLimit);
