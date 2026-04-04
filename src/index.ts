@@ -1150,34 +1150,48 @@ async function recallMemories(
 	const safeLimit = input.limit ?? 10;
 	let results: MemoryRow[] = [];
 	let retrievalMode = 'recent';
-	let warnings: string[] = [];
+	const warnings: string[] = [];
 
 	if (normalizedQuery.length === 0) {
 		results = await queryRecentMemories(env, normalizedNamespace, normalizedTag, safeLimit);
 	} else {
-		retrievalMode = 'hybrid';
-
-		const keywordResults = await queryKeywordMemories(
-			env,
-			normalizedNamespace,
-			normalizedQuery,
-			normalizedTag,
-			safeLimit,
-		);
+		let keywordResults: MemoryRow[] = [];
+		let semanticResults: MemoryRow[] = [];
 
 		try {
-			const semanticResults = await querySemanticMemories(
+			keywordResults = await queryKeywordMemories(
 				env,
 				normalizedNamespace,
 				normalizedQuery,
 				normalizedTag,
 				safeLimit,
 			);
-			results = uniqueById([...semanticResults, ...keywordResults]).slice(0, safeLimit);
 		} catch (error) {
+			warnings.push(error instanceof Error ? error.message : String(error));
+		}
+
+		try {
+			semanticResults = await querySemanticMemories(
+				env,
+				normalizedNamespace,
+				normalizedQuery,
+				normalizedTag,
+				safeLimit,
+			);
+		} catch (error) {
+			warnings.push(error instanceof Error ? error.message : String(error));
+		}
+
+		results = uniqueById([...semanticResults, ...keywordResults]).slice(0, safeLimit);
+
+		if (semanticResults.length > 0 && keywordResults.length > 0) {
+			retrievalMode = 'hybrid';
+		} else if (semanticResults.length > 0) {
+			retrievalMode = 'semantic';
+		} else if (keywordResults.length > 0) {
 			retrievalMode = 'keyword';
-			warnings = [error instanceof Error ? error.message : String(error)];
-			results = keywordResults;
+		} else {
+			retrievalMode = 'none';
 		}
 	}
 

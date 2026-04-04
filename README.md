@@ -29,7 +29,7 @@ When you **remember** something, it is written to both D1 and Vectorize. When yo
 - **Namespace isolation** -- organize memories into separate namespaces (e.g. `work`, `personal`, `project:atlas`)
 - **Tagging** -- attach up to 16 tags per memory for filtering and categorization
 - **Secure by default** -- bearer-token authentication with constant-time comparison; fails closed when no token is set
-- **Graceful degradation** -- falls back to keyword-only search if the semantic index is unavailable
+- **Graceful degradation** -- falls back to semantic-only or keyword-only search if one retrieval path is unavailable
 - **Edge-native** -- runs entirely on Cloudflare's edge network with no origin server required
 
 ### Tools

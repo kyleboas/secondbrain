@@ -157,6 +157,81 @@ describe('cloudflare-memory-mcp worker', () => {
 		});
 	});
 
+	it('falls back to semantic lookup when keyword search fails', async () => {
+		const sharedEnv = createMemoryTestEnv();
+		const baseDb = sharedEnv.MEMORY_DB;
+		let storedId = '';
+
+		const resilientEnv = {
+			...sharedEnv,
+			MEMORY_DB: {
+				prepare: (query: string) => {
+					if (query.includes('lower(content) LIKE')) {
+						throw new Error('LIKE or GLOB pattern too complex: SQLITE_ERROR');
+					}
+					return baseDb.prepare(query);
+				},
+			} as typeof sharedEnv.MEMORY_DB,
+			MEMORY_INDEX: {
+				...sharedEnv.MEMORY_INDEX,
+				upsert: async (vectors: Array<{ id: string }>) => {
+					storedId = vectors[0]?.id ?? storedId;
+				},
+				query: async () => ({
+					matches: storedId ? [{ id: storedId, score: 0.98 }] : [],
+				}),
+			} as typeof sharedEnv.MEMORY_INDEX,
+		} as TestEnv;
+
+		const rememberResponse = await fetchWithEnv(
+			'http://example.com/api/memory/remember',
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer top-secret',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					namespace: 'profile-api',
+					content: 'My favorite editor is Neovim.',
+					tags: ['preference'],
+				}),
+			},
+			resilientEnv,
+		);
+
+		expect(rememberResponse.status).toBe(200);
+
+		const lookupResponse = await fetchWithEnv(
+			'http://example.com/api/memory/lookup',
+			{
+				method: 'POST',
+				headers: {
+					Authorization: 'Bearer top-secret',
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					namespace: 'profile-api',
+					query: 'what editor do I prefer?',
+				}),
+			},
+			resilientEnv,
+		);
+
+		expect(lookupResponse.status).toBe(200);
+		await expect(lookupResponse.json()).resolves.toMatchObject({
+			ok: true,
+			namespace: 'profile-api',
+			retrievalMode: 'semantic',
+			warnings: ['LIKE or GLOB pattern too complex: SQLITE_ERROR'],
+			items: expect.arrayContaining([
+				expect.objectContaining({
+					content: 'My favorite editor is Neovim.',
+				}),
+			]),
+		});
+	});
+
 	it('lists namespaces over the direct JSON API', async () => {
 		const sharedEnv = createMemoryTestEnv();
 		await internals.autoRemember(sharedEnv, {
