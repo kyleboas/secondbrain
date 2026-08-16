@@ -6,6 +6,11 @@ export default defineConfig({
 		cloudflareTest({
 			wrangler: { configPath: './wrangler.jsonc' },
 			remoteBindings: false,
+			miniflare: {
+				serviceBindings: {
+					BUDGET_GUARD: async () => Response.json({ allowed: true }),
+				},
+			},
 		}),
 	],
 	test: {

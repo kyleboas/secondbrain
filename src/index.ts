@@ -138,6 +138,7 @@ type WorkerEnv = {
 	MEMORY_DB: D1Database;
 	AI: Ai;
 	MEMORY_INDEX: VectorizeIndex | Vectorize;
+	BUDGET_GUARD: Fetcher;
 	MCP_SHARED_TOKEN?: string;
 	ALLOW_UNAUTHENTICATED?: string;
 };
@@ -1494,7 +1495,26 @@ function createServer(env: WorkerEnv) {
 	return server;
 }
 
+async function assertBudgetAvailable(env: WorkerEnv, feature: string) {
+	let response: Response;
+	try {
+		response = await env.BUDGET_GUARD.fetch('https://budget-guard.internal/gate', {
+			headers: { accept: 'application/json' },
+		});
+	} catch (error) {
+		throw new Error(`budget_guard_unavailable:${feature}:${error instanceof Error ? error.message : 'network_error'}`);
+	}
+
+	const rawPayload: unknown = await response.json().catch(() => ({}));
+	const payload = rawPayload && typeof rawPayload === 'object'
+		? rawPayload as { allowed?: boolean; reason?: string }
+		: {};
+	if (response.ok && payload.allowed === true) return;
+	throw new Error(`budget_disabled:${feature}:${payload.reason || `HTTP ${response.status}`}`);
+}
+
 async function embedText(env: WorkerEnv, text: string) {
+	await assertBudgetAvailable(env, 'secondbrain-embedding');
 	const result = (await env.AI.run(EMBEDDING_MODEL, {
 		text: [text],
 		pooling: EMBEDDING_POOLING,

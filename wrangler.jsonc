@@ -27,6 +27,12 @@
 	"ai": {
 		"binding": "AI"
 	},
+	"services": [
+		{
+			"binding": "BUDGET_GUARD",
+			"service": "budget-guard"
+		}
+	],
 	"observability": {
 		"enabled": true
 	}
