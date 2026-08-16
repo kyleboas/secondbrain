@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import worker, { internals } from '../src';
 
 type TestEnv = typeof env & {
+	BUDGET_GUARD: Fetcher;
 	MCP_SHARED_TOKEN?: string;
 	ALLOW_UNAUTHENTICATED?: string;
 };
@@ -22,6 +23,9 @@ function createMemoryTestEnv() {
 			query: async () => ({ matches: [] }),
 			describe: async () => ({ dimensions: 3, vectorsCount: 0 }),
 		},
+		BUDGET_GUARD: {
+			fetch: async () => Response.json({ allowed: true }),
+		} as Fetcher,
 	} as TestEnv;
 }
 
@@ -217,6 +221,54 @@ describe('cloudflare-memory-mcp worker', () => {
 		releaseGate?.();
 		const lookupResponse = await lookupPromise;
 		expect(lookupResponse.status).toBe(200);
+	});
+
+	it('fails closed before AI usage while keeping keyword memory available', async () => {
+		const sharedEnv = createMemoryTestEnv();
+		let aiCalled = false;
+		const stoppedEnv = {
+			...sharedEnv,
+			AI: {
+				run: async () => {
+					aiCalled = true;
+					return { data: [[0.1, 0.2, 0.3]] };
+				},
+			} as typeof sharedEnv.AI,
+			BUDGET_GUARD: {
+				fetch: async () => Response.json({ allowed: false, reason: 'daily limit reached' }, { status: 503 }),
+			} as Fetcher,
+		} as TestEnv;
+
+		const rememberResponse = await fetchWithEnv(
+			'http://example.com/api/memory/remember',
+			{
+				method: 'POST',
+				headers: { Authorization: 'Bearer top-secret', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ namespace: 'budget-gate-test', content: 'Fail closed before paid AI.', tags: ['safety'] }),
+			},
+			stoppedEnv,
+		);
+		expect(rememberResponse.status).toBe(200);
+		await expect(rememberResponse.json()).resolves.toMatchObject({
+			semanticIndexed: false,
+			warning: 'budget_disabled:secondbrain-embedding:daily limit reached',
+		});
+
+		const lookupResponse = await fetchWithEnv(
+			'http://example.com/api/memory/lookup',
+			{
+				method: 'POST',
+				headers: { Authorization: 'Bearer top-secret', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ namespace: 'budget-gate-test', query: 'paid AI' }),
+			},
+			stoppedEnv,
+		);
+		expect(lookupResponse.status).toBe(200);
+		await expect(lookupResponse.json()).resolves.toMatchObject({
+			retrievalMode: 'keyword',
+			warnings: ['budget_disabled:secondbrain-embedding:daily limit reached'],
+		});
+		expect(aiCalled).toBe(false);
 	});
 
 	it('falls back to semantic lookup when keyword search fails', async () => {
