@@ -19,7 +19,7 @@
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.26.0",
 		"agents": "^0.7.6",
-		"zod": "^4.3.6"
+		"zod": "^4.6.6"
 	},
 	"overrides": {
 		"undici": "7.24.3"
